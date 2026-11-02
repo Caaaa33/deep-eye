@@ -2,6 +2,7 @@ from app.dataset import BaseDataset, load_dataset, save_dataset, DataItem
 from app.llm import LLM
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .checkers import BaseChecker, ResultChecker, SyntaxChecker, SelectChecker, MaxMinChecker, OrderByLimitChecker, OrderByNullChecker, JoinChecker, TimeChecker
+from .typed_repair import TypedRepairer
 from app.pipeline.validation import validate_pipeline_step
 import time
 from app.logger import logger
@@ -19,6 +20,8 @@ class SQLRevisionRunner:
     _inner_thread_pool_executor: ThreadPoolExecutor = None
     
     _checkers: List[BaseChecker] = None
+    _typed_repairer: TypedRepairer = None
+    _enable_typed_repair: bool = False
     _artifact_store: ArtifactStore = None
     _extractor_max_retry: int = 3
     _stage_config = None
@@ -70,6 +73,16 @@ class SQLRevisionRunner:
         self._inner_thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         extractor_max_retry = self._extractor_max_retry
         
+        # Execution-grounded typed repair (SIRIUS-style) replaces the legacy
+        # sequential checkers when enabled; keeps the legacy path fully intact
+        # (and default) when disabled, so the change is independently rollback-able.
+        self._enable_typed_repair = getattr(self._stage_config, "enable_typed_repair", False)
+        if self._enable_typed_repair:
+            self._typed_repairer = TypedRepairer(extractor_max_retry=extractor_max_retry)
+            self._checkers = [self._typed_repairer]
+            logger.info("Using checkers: [TypedRepairer] (enable_typed_repair=True)")
+            return
+
         # Initialize checkers based on config or default list
         checker_map = {
             "SyntaxChecker": lambda: SyntaxChecker(extractor_max_retry=extractor_max_retry),
@@ -209,6 +222,22 @@ class SQLRevisionRunner:
                 norm = self._normalize_sql(sql)
                 revised_sql, _ = norm_to_result[norm]
                 final_revised_candidates.append(revised_sql)
+
+            # Pool recovery (SIRIUS): when no revised candidate is clean, generate
+            # one recovery candidate from condensed failure feedback.
+            if self._enable_typed_repair and self._typed_repairer is not None:
+                recovery_sql, recovery_tokens = self._typed_repairer.recover_if_needed(
+                    data_item,
+                    final_revised_candidates,
+                    self._llm,
+                    self._stage_config.checker_sampling_budget,
+                )
+                if recovery_sql:
+                    final_revised_candidates.append(recovery_sql)
+                    total_token_usage["prompt_tokens"] += recovery_tokens["prompt_tokens"]
+                    total_token_usage["completion_tokens"] += recovery_tokens["completion_tokens"]
+                    total_token_usage["total_tokens"] += recovery_tokens["total_tokens"]
+
             data_item.sql_candidates_after_revision = final_revised_candidates
         data_item.sql_revision_time = time.time() - start_time
         data_item.sql_revision_llm_cost = total_token_usage

@@ -269,6 +269,7 @@ class SQLRevisionConfig(BaseModel):
     save_path: str = Field(default=_path_to_str(WORKSPACE_ROOT / "sql_revision"), description="The save path of the sql revision result")
     checker_sampling_budget: int = Field(default=5, description="The sampling budget of the checker")
     checkers: List[str] = Field(default=[], description="The list of checkers to enable")
+    enable_typed_repair: bool = Field(default=False, description="Whether to use execution-grounded typed repair (classify execution result and use directed prompts) instead of the default sequential checkers")
 
 
 class SQLSelectionConfig(BaseModel):
@@ -605,6 +606,7 @@ class Config:
             ),
             "checker_sampling_budget": sql_revision_config.get("checker_sampling_budget", 5),
             "checkers": sql_revision_config.get("checkers", []),
+            "enable_typed_repair": sql_revision_config.get("enable_typed_repair", False),
         }
         
         # sql selection config
