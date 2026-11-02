@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .checkers import BaseChecker, ResultChecker, SyntaxChecker, SelectChecker, MaxMinChecker, OrderByLimitChecker, OrderByNullChecker, JoinChecker, TimeChecker
 from .typed_repair import TypedRepairer
 from app.pipeline.validation import validate_pipeline_step
+from app.tracing import configure_tracing, submit_with_trace, trace_event, trace_scope
 import time
+from pathlib import Path
 from app.logger import logger
 from app.progress import log_progress, should_checkpoint
 from tqdm import tqdm
@@ -72,6 +74,8 @@ class SQLRevisionRunner:
         self._thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         self._inner_thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         extractor_max_retry = self._extractor_max_retry
+
+        configure_tracing(Path(self._stage_config.save_path).parent / "trace", stage="sql_revision")
         
         # Execution-grounded typed repair (SIRIUS-style) replaces the legacy
         # sequential checkers when enabled; keeps the legacy path fully intact
@@ -143,13 +147,24 @@ class SQLRevisionRunner:
         """Run all checkers sequentially for a single SQL candidate."""
         total_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         current_sql = sql
+        trace_event("revision_candidate_start", input_sql=sql, checker_count=len(self._checkers))
         for checker in self._checkers:
+            before_sql = current_sql
             current_sql, tokens = checker.check_and_revise(
                 current_sql, data_item, self._llm, self._stage_config.checker_sampling_budget
+            )
+            trace_event(
+                "revision_checker",
+                checker=checker.__class__.__name__,
+                input_sql=before_sql,
+                output_sql=current_sql,
+                changed=(before_sql or "").strip() != (current_sql or "").strip(),
+                token_usage=tokens,
             )
             total_tokens["prompt_tokens"] += tokens["prompt_tokens"]
             total_tokens["completion_tokens"] += tokens["completion_tokens"]
             total_tokens["total_tokens"] += tokens["total_tokens"]
+        trace_event("revision_candidate_end", input_sql=sql, output_sql=current_sql, token_usage=total_tokens)
         return current_sql, total_tokens
 
     def _revise_sql(self, data_item: DataItem) -> None:
@@ -159,11 +174,26 @@ class SQLRevisionRunner:
         total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         sql_candidates = data_item.sql_candidates
+        # 与 sql_candidates 对齐的来源标签；旧快照可能没有该字段，缺失时统一标 unknown
+        input_sources = list(data_item.sql_candidate_sources or [])
+        if len(input_sources) != len(sql_candidates or []):
+            input_sources = ["unknown"] * len(sql_candidates or [])
+
+        trace_event(
+            "sql_revision_start",
+            input_candidates=[{"index": idx + 1, "sql": sql} for idx, sql in enumerate(sql_candidates or [])],
+            candidate_count=len(sql_candidates) if sql_candidates else 0,
+            typed_repair_enabled=self._enable_typed_repair,
+            checkers=[checker.__class__.__name__ for checker in self._checkers],
+            checker_sampling_budget=self._stage_config.checker_sampling_budget,
+        )
         
         # If sql_candidates is empty or None, skip revision and set result to None
         if not sql_candidates:
             logger.error(f"sql_candidates is empty or None for item {data_item.question_id}, setting sql_candidates_after_revision to None")
+            trace_event("sql_revision_skipped", reason="empty_sql_candidates")
             data_item.sql_candidates_after_revision = None
+            data_item.sql_candidate_sources = None
             data_item.sql_revision_time = time.time() - start_time
             data_item.sql_revision_llm_cost = total_token_usage
             data_item.total_time += data_item.sql_revision_time
@@ -184,8 +214,15 @@ class SQLRevisionRunner:
         
         # Parallelize the revision of UNIQUE candidates only
         unique_norms = list(unique_candidates_map.keys())
+        trace_event(
+            "sql_revision_dedup",
+            original_count=len(sql_candidates),
+            unique_count=len(unique_norms),
+            duplicates_removed=len(sql_candidates) - len(unique_norms),
+            unique_candidates=[{"normalized": norm, "sql": unique_candidates_map[norm]} for norm in unique_norms],
+        )
         future_to_norm = {
-            self._inner_thread_pool_executor.submit(self._revise_one_candidate, unique_candidates_map[norm], data_item): norm
+            submit_with_trace(self._inner_thread_pool_executor, self._revise_one_candidate, unique_candidates_map[norm], data_item): norm
             for norm in unique_norms
         }
         
@@ -210,18 +247,39 @@ class SQLRevisionRunner:
             total_token_usage["prompt_tokens"] += tokens["prompt_tokens"]
             total_token_usage["completion_tokens"] += tokens["completion_tokens"]
             total_token_usage["total_tokens"] += tokens["total_tokens"]
+
+        trace_event(
+            "sql_revision_candidates_revised",
+            results=[
+                {
+                    "normalized": norm,
+                    "input_sql": unique_candidates_map[norm],
+                    "output_sql": revised_sql,
+                    "token_usage": tokens,
+                }
+                for norm, (revised_sql, tokens) in norm_to_result.items()
+            ],
+        )
         
         # If any revision failed, set entire result to None
         if has_failure:
             logger.error(f"Some SQL revisions failed for item {data_item.question_id}, setting sql_candidates_after_revision to None")
+            trace_event(
+                "sql_revision_failed",
+                reason="candidate_revision_exception",
+                failed_candidates=[norm for norm, (revised_sql, _) in norm_to_result.items() if revised_sql is None],
+            )
             data_item.sql_candidates_after_revision = None
+            data_item.sql_candidate_sources = None
         else:
             # Map results back to the original candidates list (preserving order and duplicates)
             final_revised_candidates = []
-            for sql in sql_candidates:
+            final_candidate_sources = []
+            for idx, sql in enumerate(sql_candidates):
                 norm = self._normalize_sql(sql)
                 revised_sql, _ = norm_to_result[norm]
                 final_revised_candidates.append(revised_sql)
+                final_candidate_sources.append(input_sources[idx])
 
             # Pool recovery (SIRIUS): when no revised candidate is clean, generate
             # one recovery candidate from condensed failure feedback.
@@ -234,11 +292,34 @@ class SQLRevisionRunner:
                 )
                 if recovery_sql:
                     final_revised_candidates.append(recovery_sql)
+                    final_candidate_sources.append("recovery")
+                    trace_event(
+                        "sql_revision_recovery",
+                        sql=recovery_sql,
+                        token_usage=recovery_tokens,
+                        appended_index=len(final_revised_candidates),
+                    )
                     total_token_usage["prompt_tokens"] += recovery_tokens["prompt_tokens"]
                     total_token_usage["completion_tokens"] += recovery_tokens["completion_tokens"]
                     total_token_usage["total_tokens"] += recovery_tokens["total_tokens"]
 
             data_item.sql_candidates_after_revision = final_revised_candidates
+            data_item.sql_candidate_sources = final_candidate_sources
+            trace_event(
+                "sql_revision_final_candidates",
+                candidates=[
+                    {"index": idx + 1, "sql": sql, "source": final_candidate_sources[idx]}
+                    for idx, sql in enumerate(final_revised_candidates)
+                ],
+                count=len(final_revised_candidates),
+            )
+        trace_event(
+            "sql_revision_end",
+            status="failed" if has_failure else "ok",
+            final_candidate_count=len(data_item.sql_candidates_after_revision or []),
+            duration_ms=round((time.time() - start_time) * 1000, 1),
+            token_usage=total_token_usage,
+        )
         data_item.sql_revision_time = time.time() - start_time
         data_item.sql_revision_llm_cost = total_token_usage
         data_item.total_time += data_item.sql_revision_time
@@ -248,13 +329,18 @@ class SQLRevisionRunner:
             "total_tokens": data_item.total_llm_cost["total_tokens"] + data_item.sql_revision_llm_cost["total_tokens"],
         }
         
+    def _revise_sql_scoped(self, data_item: DataItem) -> None:
+        """带追踪上下文（stage/item_id）的单条修订入口。"""
+        with trace_scope(stage="sql_revision", item_id=data_item.get_item_id()):
+            self._revise_sql(data_item)
+
     def run(self):
         future_to_item = {}
         for data_item in self._dataset:
             if data_item.is_stage_complete("sql_revision"):
                 logger.info(f"Skipping data item {data_item.question_id} because it has already been revised")
                 continue
-            future = self._thread_pool_executor.submit(self._revise_sql, data_item)
+            future = self._thread_pool_executor.submit(self._revise_sql_scoped, data_item)
             future_to_item[future] = data_item
         for idx, future in tqdm(enumerate(as_completed(future_to_item), start=1), total=len(future_to_item), desc="Revising SQL"):
             future.result()

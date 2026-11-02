@@ -15,6 +15,8 @@ import time
 from app.services import ArtifactStore, STAGE_ARTIFACT_FIELDS, configure_execution_service, configure_schema_service, get_execution_service, get_schema_service, load_stage_dataset, reset_execution_service, reset_schema_service
 from app.llm_extractor import LLMExtractor
 from app.pipeline.sql_selection.ast_signature import structural_support_select
+from app.tracing import configure_tracing, submit_with_trace, trace_event, trace_scope
+from pathlib import Path
 from tabulate import tabulate
 
 
@@ -136,6 +138,7 @@ class SQLSelectionRunner:
         self._inner_thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         self._execution_service = get_execution_service()
         self._extractor = LLMExtractor(max_retry=self._extractor_max_retry)
+        configure_tracing(Path(self._stage_config.save_path).parent / "trace", stage="sql_selection")
 
     @classmethod
     def from_config(cls, app_config=None) -> "SQLSelectionRunner":
@@ -200,6 +203,14 @@ class SQLSelectionRunner:
 
     def _get_top_k_sql_candidates(self, data_item: DataItem) -> Tuple[List[Tuple[str, str, float, float]], Dict[str, Any]]:
         item_id = data_item.get_item_id()
+        trace_event(
+            "selection_input",
+            item_id=item_id,
+            question=data_item.question,
+            evidence=data_item.evidence,
+            candidate_count=len(data_item.sql_candidates_after_revision),
+            candidates=list(data_item.sql_candidates_after_revision),
+        )
         valid_sql_candidates = []
         fallback_sql_candidates = []
         sql_map_to_execution_result = {}
@@ -209,6 +220,17 @@ class SQLSelectionRunner:
             if execution_result is None:
                 execution_result = self._execution_service.execute(data_item, sql_candidate)
                 sql_map_to_execution_result[sql_candidate] = execution_result
+                trace_event(
+                    "selection_execution_summary",
+                    item_id=item_id,
+                    candidate_index=candidate_idx,
+                    sql=sql_candidate,
+                    result_type=execution_result.result_type,
+                    error_message=execution_result.error_message,
+                    execution_time=execution_result.execution_time,
+                    row_count=len(execution_result.result_rows) if execution_result.result_rows is not None else None,
+                    result_table_str=execution_result.result_table_str,
+                )
             if execution_result.result_rows is None:
                 continue
             result_hash = sql_map_to_result_hash.get(sql_candidate)
@@ -224,6 +246,13 @@ class SQLSelectionRunner:
             valid_sql_candidates = fallback_sql_candidates
 
         if len(valid_sql_candidates) == 0:
+            trace_event(
+                "selection_consistency",
+                item_id=item_id,
+                valid_count=0,
+                fallback_count=len(fallback_sql_candidates),
+                outcome="no_valid_candidate",
+            )
             return [], {
                 "valid_count": 0,
                 "unique_result_count": 0,
@@ -244,6 +273,24 @@ class SQLSelectionRunner:
                 )
                 seen_result_set.add(result_hash)
 
+        trace_event(
+            "selection_consistency",
+            item_id=item_id,
+            valid_count=len(valid_sql_candidates),
+            fallback_count=len(fallback_sql_candidates),
+            unique_result_count=len(deduplicated_valid_sql_candidates),
+            max_class_size=max(counter.values()) if counter else 0,
+            result_hash_votes={str(hash_value): count for hash_value, count in counter.items()},
+            deduplicated_candidates=[
+                {
+                    "sql": sql_candidate,
+                    "result_hash": str(result_hash),
+                    "consistency": consistency_score,
+                    "execution_time": execution_time,
+                }
+                for sql_candidate, result_hash, consistency_score, execution_time in deduplicated_valid_sql_candidates
+            ],
+        )
 
         top_k_sql_candidates = sorted(
             deduplicated_valid_sql_candidates,
@@ -256,6 +303,20 @@ class SQLSelectionRunner:
             top_k_sql_candidates,
         )
 
+        trace_event(
+            "selection_top_k",
+            item_id=item_id,
+            top_k=self._stage_config.filter_top_k_sql,
+            top_k_candidates=[
+                {
+                    "index": idx,
+                    "sql": sql_candidate,
+                    "consistency": consistency_score,
+                    "execution_time": execution_time,
+                }
+                for idx, (sql_candidate, _, consistency_score, execution_time) in enumerate(top_k_sql_candidates)
+            ],
+        )
 
         candidates = [
             (
@@ -301,6 +362,15 @@ class SQLSelectionRunner:
                     repeat=self._timing_refine_repeat,
                 )
                 did_refine = True
+                trace_event(
+                    "selection_timing_refine",
+                    item_id=data_item.get_item_id(),
+                    sql=sql_candidate,
+                    consistency=consistency_score,
+                    repeat=self._timing_refine_repeat,
+                    original_execution_time=original_execution_time,
+                    refined_execution_time=execution_time,
+                )
             refined_sql_candidates.append(
                 (sql_candidate, result_hash, consistency_score, execution_time)
             )
@@ -368,6 +438,19 @@ class SQLSelectionRunner:
             execution_result_table_str_b,
             db_type=db_type,
         )
+        trace_event(
+            "selection_compare_prompt",
+            a_idx=a_idx,
+            b_idx=b_idx,
+            swapped=swapped,
+            judge_model=self._judge_llm.llm_config.model,
+            judge_is_stage_llm=self._judge_llm is self._llm,
+            presented_sql_a=sql_a,
+            presented_sql_b=sql_b,
+            presented_table_a=execution_result_table_str_a,
+            presented_table_b=execution_result_table_str_b,
+            prompt_length=len(prompt),
+        )
         
         votes, total_token_usage = self._extractor.extract_with_retry(
             llm=self._judge_llm,
@@ -376,6 +459,16 @@ class SQLSelectionRunner:
             fix_end_token=self._judge_llm.llm_config.fix_end_token,
             end_token="</result>",
             n=self._stage_config.evaluator_sampling_budget,
+            trace_label="sql_selection.pairwise",
+            trace_extra={"a_idx": a_idx, "b_idx": b_idx, "swapped": swapped},
+        )
+        trace_event(
+            "selection_compare",
+            a_idx=a_idx,
+            b_idx=b_idx,
+            swapped=swapped,
+            votes=votes,
+            token_usage=total_token_usage,
         )
         
         return votes, total_token_usage, swapped
@@ -486,6 +579,13 @@ class SQLSelectionRunner:
         top_k_sql_candidates, selection_meta = self._get_top_k_sql_candidates(data_item)
         
         if len(top_k_sql_candidates) == 0:
+            trace_event(
+                "selection_decision",
+                item_id=item_id,
+                branch="no_valid_candidate",
+                action="fallback_to_first_candidate",
+                final_selected_sql=data_item.sql_candidates_after_revision[0] if data_item.sql_candidates_after_revision else "Error",
+            )
             logger.warning("No valid SQL candidates, backing to top-1 SQL")
             data_item.final_selected_sql = data_item.sql_candidates_after_revision[0] if data_item.sql_candidates_after_revision else "Error"
             data_item.sql_selection_time = time.time() - start_time
@@ -496,9 +596,25 @@ class SQLSelectionRunner:
                 "completion_tokens": data_item.total_llm_cost["completion_tokens"] + data_item.sql_selection_llm_cost["completion_tokens"],
                 "total_tokens": data_item.total_llm_cost["total_tokens"] + data_item.sql_selection_llm_cost["total_tokens"],
             }
+            trace_event(
+                "selection_end",
+                item_id=item_id,
+                status="completed",
+                branch="no_valid_candidate",
+                final_selected_sql=data_item.final_selected_sql,
+                token_usage=total_token_usage,
+                duration_ms=data_item.sql_selection_time * 1000,
+            )
             return
         
         if len(top_k_sql_candidates) == 1:
+            trace_event(
+                "selection_decision",
+                item_id=item_id,
+                branch="single_candidate",
+                action="direct_select",
+                final_selected_sql=top_k_sql_candidates[0][0],
+            )
             logger.info("Only one valid SQL candidate, directly select it")
             data_item.final_selected_sql = top_k_sql_candidates[0][0]
             data_item.sql_selection_time = time.time() - start_time
@@ -509,6 +625,15 @@ class SQLSelectionRunner:
                 "completion_tokens": data_item.total_llm_cost["completion_tokens"] + data_item.sql_selection_llm_cost["completion_tokens"],
                 "total_tokens": data_item.total_llm_cost["total_tokens"] + data_item.sql_selection_llm_cost["total_tokens"],
             }
+            trace_event(
+                "selection_end",
+                item_id=item_id,
+                status="completed",
+                branch="single_candidate",
+                final_selected_sql=data_item.final_selected_sql,
+                token_usage=total_token_usage,
+                duration_ms=data_item.sql_selection_time * 1000,
+            )
             return
         
         # SIRIUS §3.5: pairwise reward-model comparison is mandatory whenever
@@ -531,11 +656,40 @@ class SQLSelectionRunner:
         sql_to_idx = {sql[0]: idx for idx, sql in enumerate(top_k_sql_candidates)}
         pair_sqls_to_eval = self._get_pair_sqls_to_eval(top_k_sql_candidates)
 
+        trace_event(
+            "selection_decision",
+            item_id=item_id,
+            branch="pairwise",
+            action="start_pairwise_comparison",
+            consistency_gap=top_k_sql_candidates[0][2] - top_k_sql_candidates[1][2],
+            top_k_count=len(top_k_sql_candidates),
+            valid_count=selection_meta.get("valid_count"),
+            unique_result_count=selection_meta.get("unique_result_count"),
+            max_class_size=selection_meta.get("max_class_size"),
+        )
+        trace_event(
+            "selection_pair_plan",
+            item_id=item_id,
+            pair_count=len(pair_sqls_to_eval),
+            evaluator_sampling_budget=self._stage_config.evaluator_sampling_budget,
+            pairs=[
+                {
+                    "a_idx": sql_to_idx[sql_a[0]],
+                    "b_idx": sql_to_idx[sql_b[0]],
+                    "swapped": swapped,
+                    "sql_a": sql_a[0],
+                    "sql_b": sql_b[0],
+                }
+                for sql_a, sql_b, swapped in pair_sqls_to_eval
+            ],
+        )
         
         # Parallelize the pairwise comparisons
         has_failure = False
         future_to_pair = {
-            self._inner_thread_pool_executor.submit(self._compare_sqls,
+            submit_with_trace(
+                self._inner_thread_pool_executor,
+                self._compare_sqls,
                 sql_a[0],
                 sql_a[1],
                 sql_b[0],
@@ -568,12 +722,30 @@ class SQLSelectionRunner:
                 total_token_usage["total_tokens"] += token_usage["total_tokens"]
             except Exception as e:
                 logger.error(f"Error comparing SQLs {sql_a[0]} and {sql_b[0]}: {e}")
+                trace_event(
+                    "selection_compare_error",
+                    item_id=item_id,
+                    a_idx=sql_to_idx[sql_a[0]],
+                    b_idx=sql_to_idx[sql_b[0]],
+                    swapped=swapped,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                )
                 has_failure = True
         
         # If any comparison failed, set result to None
         if has_failure:
             logger.error(f"Some SQL comparisons failed for item {data_item.question_id}, setting final_selected_sql to None")
             data_item.final_selected_sql = None
+            trace_event(
+                "selection_end",
+                item_id=item_id,
+                status="failed",
+                reason="pairwise_comparison_failure",
+                final_selected_sql=None,
+                token_usage=total_token_usage,
+                duration_ms=(time.time() - start_time) * 1000,
+            )
         else:
             # Candidate provenance (dc / skeleton / icl / recovery) aligned with
             # the revised pool; needed for cross-source structural support.
@@ -597,6 +769,27 @@ class SQLSelectionRunner:
             merged_scores = s_maj + s_rm
             ranking = np.argsort(-merged_scores)
 
+            trace_event(
+                "selection_win_matrix",
+                item_id=item_id,
+                # NaN 槽位（未产出投票）序列化为 null，避免 events.jsonl 出现非法 JSON 字面量
+                win_matrix=[
+                    [[None if np.isnan(v) else float(v) for v in slot] for slot in row]
+                    for row in win_matrix
+                ],
+                robust_win_matrix=robust_win_matrix.tolist(),
+            )
+            trace_event(
+                "selection_ranking",
+                item_id=item_id,
+                rm_scores=s_rm.tolist(),
+                mean_win_scores=mean_win_scores.tolist(),
+                elo_ratings=elo_ratings.tolist(),
+                consistency_scores=s_maj.tolist(),
+                merged_scores=merged_scores.tolist(),
+                ranking=ranking.tolist(),
+                sources=top_k_sources,
+            )
 
             # SIRIUS adaptive confidence gating: Stage 2 is only attempted when
             # the merged score and the reward-model score both leave the top-2
@@ -614,6 +807,16 @@ class SQLSelectionRunner:
                 "max_class_size_ok": max_class_size <= 8,
             }
             gate_triggered = all(gate_conditions.values())
+            trace_event(
+                "selection_gate",
+                item_id=item_id,
+                triggered=gate_triggered,
+                conditions=gate_conditions,
+                merged_top2_gap=merged_top2_gap,
+                rm_top2_gap=rm_top2_gap,
+                top_k_count=top_k_count,
+                max_class_size=max_class_size,
+            )
 
             best_idx = int(ranking[0])
             if gate_triggered:
@@ -633,6 +836,13 @@ class SQLSelectionRunner:
                         f"idx={ranking[0]} -> idx={best_idx} "
                         f"(support {stage2_detail['supports'][ranking[0]]} -> {stage2_detail['supports'][best_idx]})"
                     )
+                trace_event(
+                    "selection_structural_override",
+                    item_id=item_id,
+                    initial_best_idx=int(ranking[0]),
+                    final_best_idx=int(best_idx),
+                    **stage2_detail,
+                )
             data_item.final_selected_sql = top_k_sql_candidates[best_idx][0]
         
         data_item.sql_selection_time = time.time() - start_time
@@ -643,7 +853,18 @@ class SQLSelectionRunner:
             "completion_tokens": data_item.total_llm_cost["completion_tokens"] + data_item.sql_selection_llm_cost["completion_tokens"],
             "total_tokens": data_item.total_llm_cost["total_tokens"] + data_item.sql_selection_llm_cost["total_tokens"],
         }
+        trace_event(
+            "selection_end",
+            item_id=item_id,
+            status="completed",
+            final_selected_sql=data_item.final_selected_sql,
+            token_usage=total_token_usage,
+            duration_ms=data_item.sql_selection_time * 1000,
+        )
     
+    def _select_best_sql_scoped(self, data_item: DataItem) -> None:
+        with trace_scope(stage="sql_selection", item_id=data_item.get_item_id()):
+            self._select_best_sql(data_item)
 
     def run(self):
         future_to_item = {}
@@ -651,7 +872,7 @@ class SQLSelectionRunner:
             if data_item.is_stage_complete("sql_selection"):
                 logger.info(f"Skipping data item {data_item.question_id} because it has already been selected")
                 continue
-            future = self._thread_pool_executor.submit(self._select_best_sql, data_item)
+            future = submit_with_trace(self._thread_pool_executor, self._select_best_sql_scoped, data_item)
             future_to_item[future] = data_item
         for idx, future in tqdm(enumerate(as_completed(future_to_item), start=1), total=len(future_to_item), desc="Selecting Best SQL"):
             future.result()

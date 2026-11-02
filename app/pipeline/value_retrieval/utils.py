@@ -7,6 +7,7 @@ import ast
 import re
 import json
 from app.logger import logger
+from app.tracing import trace_event
 from tenacity import(
     retry,
     retry_if_exception_type,
@@ -53,6 +54,7 @@ def extract_keywords(
     fix_end_token: bool = False,
     extractor_max_retry: Optional[int] = None,
     extractor: Optional[LLMExtractor] = None,
+    trace_label: Optional[str] = None,
 ) -> tuple[List[str], Dict[str, int]]:
     prompt = PromptFactory.format_keywords_extraction_prompt(question, evidence)
 
@@ -65,6 +67,7 @@ def extract_keywords(
         fix_end_token=fix_end_token,
         end_token="</result>",
         n=1,
+        trace_label=trace_label,
     )
 
     if results:
@@ -73,7 +76,20 @@ def extract_keywords(
         logger.warning("Failed to extract keywords from LLM response, using default keywords splitting strategy")
         keywords_list = question.split(" ") + evidence.split(" ")
 
+    # 记录 LLM 解析出的原始关键词与后处理后的关键词
+    raw_parsed_keywords = list(keywords_list)
     keywords_list = _post_process_keywords(keywords_list)
+    trace_event(
+        "value_keywords",
+        raw_parsed_keywords=raw_parsed_keywords,
+        raw_parsed_count=len(raw_parsed_keywords),
+        keywords=keywords_list,
+        keyword_count=len(keywords_list),
+        used_fallback=not results,
+        fix_end_token=fix_end_token,
+        token_usage=total_token_usage,
+        prompt=prompt,
+    )
 
     return keywords_list, total_token_usage
 

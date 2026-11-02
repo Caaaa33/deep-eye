@@ -24,6 +24,7 @@ from app.logger import logger
 from app.progress import log_progress, should_checkpoint
 from app.services import ArtifactStore, STAGE_ARTIFACT_FIELDS, configure_schema_service, get_schema_service, load_stage_dataset, reset_schema_service
 from app.llm_extractor import LLMExtractor
+from app.tracing import configure_tracing, submit_with_trace, trace_event, trace_scope
 
 
 def _is_spider2_item(data_item: DataItem) -> bool:
@@ -129,6 +130,9 @@ class ValueRetrievalRunner:
         self._thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         self._column_query_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         self._keyword_extractor = LLMExtractor(max_retry=self._extractor_max_retry)
+
+        # 初始化执行追踪，事件落到 snapshot 同级的 trace 目录
+        configure_tracing(Path(self._stage_config.save_path).parent / "trace", stage="value_retrieval")
 
     @classmethod
     def from_config(cls, app_config=None) -> "ValueRetrievalRunner":
@@ -243,6 +247,7 @@ class ValueRetrievalRunner:
             fix_end_token=self._llm.llm_config.fix_end_token,
             extractor_max_retry=self._extractor_max_retry,
             extractor=self._keyword_extractor,
+            trace_label="value_retrieval.keywords",
         )
 
     @staticmethod
@@ -254,6 +259,37 @@ class ValueRetrievalRunner:
         start_time = time.time()
         item_log_prefix = self._get_item_log_prefix(data_item)
         logger.info(f"{item_log_prefix} started")
+
+        # 记录输入规模与配置；缓存命中情况取懒加载前的状态
+        schema_tables = data_item.database_schema.get("tables", {})
+        input_table_count = len(schema_tables)
+        input_column_count = sum(len(table.get("columns", {})) for table in schema_tables.values())
+        if self._retrieval_backend == "local_index":
+            retrieval_resource_cached = data_item.database_id in self._local_value_index_dict
+        else:
+            retrieval_resource_cached = data_item.database_id in self._vector_db_collection_dict
+        prepared_schema_cached = data_item.database_id in self._prepared_sqlite_schema_dict
+        trace_event(
+            "value_retrieval_start",
+            question_id=data_item.question_id,
+            db_id=data_item.database_id,
+            database_path=str(getattr(data_item, "database_path", "")),
+            db_type=data_item.database_schema.get("db_type", "sqlite"),
+            table_count=input_table_count,
+            column_count=input_column_count,
+            tables=list(schema_tables.keys()),
+            top_k=self._stage_config.max_values_per_column,
+            max_values_per_column=self._stage_config.max_values_per_column,
+            backend=self._retrieval_backend,
+            local_index_device=self._local_index_device,
+            parallelism=self._parallelism,
+            embedding_batch_size=self._embedding_batch_size,
+            lower_meta_data=self._vector_database_config.lower_meta_data,
+            retrieval_resource_cached=retrieval_resource_cached,
+            prepared_schema_cached=prepared_schema_cached,
+            question=data_item.question,
+            evidence=data_item.evidence,
+        )
         
         # 1. LLM Keyword Extraction
         keyword_start_time = time.time()
@@ -316,7 +352,8 @@ class ValueRetrievalRunner:
         if column_tasks:
             completed_columns = 0
             future_to_col = {
-                self._column_query_executor.submit(
+                submit_with_trace(
+                    self._column_query_executor,
                     self._retrieve_values_for_column,
                     query_embeddings,
                     retrieval_resource,
@@ -330,6 +367,27 @@ class ValueRetrievalRunner:
                 original_table_name = map_lower_table_name_to_original_table_name(result["table_name"], data_item.database_schema)
                 original_column_name = map_lower_column_name_to_original_column_name(result["table_name"], result["column_name"], data_item.database_schema)
                 data_item.retrieved_values[original_table_name][original_column_name] = result["values"]
+                # 逐列记录检索结果
+                task_table_name, task_column_name = future_to_col[future]
+                column_type = data_item.database_schema["tables"][task_table_name]["columns"][task_column_name].get("column_type")
+                trace_event(
+                    "value_column_result",
+                    table=original_table_name,
+                    column=original_column_name,
+                    table_key=task_table_name,
+                    column_key=task_column_name,
+                    column_type=column_type,
+                    keywords=keywords,
+                    keyword_count=len(keywords),
+                    candidates=result["values"],
+                    candidate_count=len(result["values"]),
+                    kept_values=[value["value"] for value in result["values"]],
+                    kept_count=len(result["values"]),
+                    cached=retrieval_resource_cached,
+                    backend=self._retrieval_backend,
+                    lower_meta_data=self._vector_database_config.lower_meta_data,
+                    query_embedding_count=len(query_embeddings),
+                )
                 previous_completed_columns = completed_columns
                 completed_columns += 1
                 log_progress(
@@ -357,6 +415,25 @@ class ValueRetrievalRunner:
         else:
             for k, v in data_item.value_retrieval_llm_cost.items():
                 data_item.total_llm_cost[k] += v
+        columns_with_values = sum(
+            1 for column_dict in data_item.retrieved_values.values()
+            for values in column_dict.values() if values
+        )
+        trace_event(
+            "value_retrieval_end",
+            total_time=data_item.value_retrieval_time,
+            keyword_count=len(keywords),
+            query_embedding_count=len(query_embeddings),
+            total_column_tasks=total_column_tasks,
+            columns_with_values=columns_with_values,
+            columns_without_values=total_column_tasks - columns_with_values,
+            retrieved_value_count=sum(
+                len(values) for column_dict in data_item.retrieved_values.values()
+                for values in column_dict.values()
+            ),
+            token_usage=data_item.value_retrieval_llm_cost,
+            total_llm_cost=data_item.total_llm_cost,
+        )
         logger.info(
             f"{item_log_prefix} completed in {data_item.value_retrieval_time:.2f}s "
             f"(text_columns={total_column_tasks})"
@@ -364,6 +441,8 @@ class ValueRetrievalRunner:
 
     def _update_database_schema(self, data_item: DataItem, prepared_schema: Dict[str, Any]):
         database_schema_after_value_retrieval = self._clone_database_schema(data_item.database_schema)
+        # 记录写回 schema 的 value_examples 明细
+        update_stats = {}
         for table_name, column_dict in data_item.retrieved_values.items():
             for column_name, values in column_dict.items():
                 original_values = data_item.database_schema["tables"][table_name]["columns"][column_name].get("value_examples")
@@ -372,7 +451,23 @@ class ValueRetrievalRunner:
                 new_values = [value["value"] for value in values] + original_values
                 new_values = new_values[:self._stage_config.max_values_per_column]
                 database_schema_after_value_retrieval["tables"][table_name]["columns"][column_name]["value_examples"] = new_values
+                update_stats.setdefault(table_name, {})[column_name] = {
+                    "retrieved_count": len(values),
+                    "previous_count": len(original_values),
+                    "final_count": len(new_values),
+                    "value_examples": new_values,
+                }
         data_item.database_schema_after_value_retrieval = database_schema_after_value_retrieval
+        trace_event(
+            "value_schema_update",
+            table_count=len(update_stats),
+            column_count=sum(len(columns) for columns in update_stats.values()),
+            written_value_count=sum(
+                stats["final_count"] for columns in update_stats.values() for stats in columns.values()
+            ),
+            max_values_per_column=self._stage_config.max_values_per_column,
+            tables=update_stats,
+        )
 
     @staticmethod
     def _clone_database_schema(database_schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -439,6 +534,20 @@ class ValueRetrievalRunner:
         Handle items by skipping value retrieval.
         Used for Spider2 datasets where value retrieval is not required.
         """
+        trace_event(
+            "value_retrieval_start",
+            skipped=True,
+            reason="spider2_dataset",
+            db_id=data_item.database_id,
+            database_path=str(getattr(data_item, "database_path", "")),
+            table_count=len(data_item.database_schema.get("tables", {})),
+            column_count=sum(
+                len(table.get("columns", {}))
+                for table in data_item.database_schema.get("tables", {}).values()
+            ),
+            question=data_item.question,
+            evidence=data_item.evidence,
+        )
         # Set empty values for value retrieval fields
         data_item.question_keywords = []
         data_item.value_retrieval_llm_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -448,8 +557,14 @@ class ValueRetrievalRunner:
         data_item.total_llm_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         # Copy original schema as-is (no value retrieval enhancement)
         data_item.database_schema_after_value_retrieval = self._clone_database_schema(data_item.database_schema)
+        trace_event("value_retrieval_end", skipped=True, reason="spider2_dataset", total_time=0.0)
         
         logger.info(f"{self._get_item_log_prefix(data_item)} skipped")
+
+    def _process_item(self, data_item: DataItem):
+        """单条 item 的处理入口：设置追踪上下文。"""
+        with trace_scope(item_id=data_item.get_item_id()):
+            self._retrieve_values_for_item(data_item)
 
     def run(self):
         future_to_item = {}
@@ -462,13 +577,14 @@ class ValueRetrievalRunner:
             
             # Skip Spider2 datasets - Vector DB and Value Retrieval not needed
             if _is_spider2_item(data_item):
-                self._skip_value_retrieval_for_item(data_item)
+                with trace_scope(item_id=data_item.get_item_id()):
+                    self._skip_value_retrieval_for_item(data_item)
                 self._artifact_store.record_item(data_item)
                 skipped_spider2_count += 1
                 continue
             
             # Submit each item to the thread pool (SQLite only)
-            future = self._thread_pool_executor.submit(self._retrieve_values_for_item, data_item)
+            future = submit_with_trace(self._thread_pool_executor, self._process_item, data_item)
             future_to_item[future] = data_item
         
         if skipped_spider2_count > 0:

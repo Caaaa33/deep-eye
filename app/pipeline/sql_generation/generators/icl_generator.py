@@ -4,6 +4,7 @@ from app.llm import LLM
 from app.logger import logger
 from app.prompt import PromptFactory
 from app.few_shot import get_few_shot_examples_for_item
+from app.tracing import trace_event
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import json
@@ -34,6 +35,14 @@ class ICLGenerator(BaseSQLGenerator):
             return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         few_shot_examples, few_shot_source = get_few_shot_examples_for_item(data_item, self._few_shot_examples)
+
+        # 记录实际使用的 few-shot 示例（含检索分数等原始字段）
+        trace_event(
+            "few_shot_examples_used",
+            few_shot_source=few_shot_source,
+            example_count=len(few_shot_examples),
+            examples=few_shot_examples,
+        )
             
         if not few_shot_examples:
             logger.warning(f"Few-shot examples not found for {data_item.get_item_id()}, returning empty result.")
@@ -58,6 +67,17 @@ class ICLGenerator(BaseSQLGenerator):
         if final_prompt is None:
             logger.error(f"CRITICAL: Even minimal ICL prompt for item {data_item.question_id} exceeds token limit. Returning empty result.")
             return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        # few-shot 示例拼接在 prompt 的 FEW_SHOT_EXAMPLES 段（全文已由 base 的 prompt_built 记录）
+        trace_event(
+            "icl_prompt",
+            few_shot_source=few_shot_source,
+            few_shot_count=len(few_shot_examples),
+            few_shot_examples=few_shot_examples,
+            few_shot_insert_slot="FEW_SHOT_EXAMPLES",
+            few_shot_insert_note="每个示例按 Question/Hint/SQL 格式拼接在 FEW_SHOT_EXAMPLES 段",
+            final_prompt_chars=len(final_prompt),
+        )
             
         extractor = self._get_extractor()
         all_sql_candidates, total_token_usage = extractor.extract_with_retry(
@@ -66,7 +86,16 @@ class ICLGenerator(BaseSQLGenerator):
             rule_parser=self._parse_llm_response,
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
-            n=sampling_budget
+            n=sampling_budget,
+            trace_label="sql_generation.icl",
+        )
+
+        # 记录解析出的最终 SQL 列表
+        trace_event(
+            "generator_parse",
+            generator="icl",
+            candidate_count=len(all_sql_candidates),
+            candidates=all_sql_candidates,
         )
         
         return all_sql_candidates, total_token_usage

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, TypeVar
 from app.logger import logger
+from app.tracing import trace_event
 
 if TYPE_CHECKING:
     from app.llm import LLM
@@ -80,9 +81,25 @@ class LLMExtractor:
         parser_kwargs = parser_kwargs or {}
         retry_count = 0
         retry_limit = self.max_retry if max_retry is None else max_retry
-        
+
+        # trace_* 参数会继续透传给 llm.ask（由 ask 负责 pop），这里只读取用于标记
+        trace_label = llm_kwargs.get("trace_label")
+        trace_event(
+            "extract_start",
+            label=trace_label,
+            requested_n=n,
+            retry_limit=retry_limit,
+            rule_parser=getattr(rule_parser, "__name__", str(rule_parser)),
+            fix_end_token=fix_end_token,
+            end_token=end_token,
+            message_count=len(messages),
+        )
+
         while len(all_results) < n and retry_count < retry_limit:
             remaining = n - len(all_results)
+            attempt = retry_count + 1
+            before_count = len(all_results)
+            trace_event("extract_attempt", label=trace_label, attempt=attempt, remaining=remaining)
             
             try:
                 responses, token_usage = llm.ask(messages, n=remaining, **llm_kwargs)
@@ -101,6 +118,7 @@ class LLMExtractor:
                     try:
                         if not content or not content.strip():
                             logger.warning("LLM returned empty content for response")
+                            trace_event("extract_parse", label=trace_label, attempt=attempt, success=False, reason="empty_content")
                             continue
 
                         result = rule_parser(content, **parser_kwargs)
@@ -113,20 +131,71 @@ class LLMExtractor:
                         if is_valid:
                             all_results.append(result)
                             logger.debug(f"Rule parsing succeeded")
+                            trace_event(
+                                "extract_parse",
+                                label=trace_label,
+                                attempt=attempt,
+                                success=True,
+                                content_length=len(content),
+                                content_preview=content,
+                                parsed_result=result,
+                            )
                         else:
                             logger.warning(f"Rule parsing returned invalid or empty result")
                             logger.debug(f"Response content: {content}")
+                            trace_event(
+                                "extract_parse",
+                                label=trace_label,
+                                attempt=attempt,
+                                success=False,
+                                reason="invalid_or_empty_result",
+                                content_length=len(content),
+                                content_preview=content,
+                            )
                     except Exception as e:
                         logger.warning(f"Rule parsing failed with exception: {e}")
                         logger.debug(f"Response content: {content}")
+                        trace_event(
+                            "extract_parse",
+                            label=trace_label,
+                            attempt=attempt,
+                            success=False,
+                            reason="parser_exception",
+                            error=f"{type(e).__name__}: {e}",
+                            content_length=len(content),
+                            content_preview=content,
+                        )
                         
             except Exception as e:
                 logger.warning(f"Error during LLM call (retry {retry_count + 1}/{retry_limit}): {e}")
+                trace_event(
+                    "extract_llm_error",
+                    label=trace_label,
+                    attempt=attempt,
+                    error=f"{type(e).__name__}: {e}",
+                )
             
+            trace_event(
+                "extract_attempt_end",
+                label=trace_label,
+                attempt=attempt,
+                newly_parsed=len(all_results) - before_count,
+                collected=len(all_results),
+                requested_n=n,
+            )
             retry_count += 1
         
         if len(all_results) < n:
             logger.warning(f"Only got {len(all_results)}/{n} valid results after {retry_limit} retries")
+
+        trace_event(
+            "extract_end",
+            label=trace_label,
+            requested_n=n,
+            collected=len(all_results),
+            retries_used=retry_count,
+            token_usage=total_token_usage,
+        )
         
         return all_results, total_token_usage
 

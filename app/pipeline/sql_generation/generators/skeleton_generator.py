@@ -3,6 +3,7 @@ from app.dataset import DataItem
 from app.llm import LLM
 from app.logger import logger
 from app.prompt import PromptFactory
+from app.tracing import trace_event
 from typing import Dict, List, Tuple
 
 
@@ -36,7 +37,16 @@ class SkeletonGenerator(BaseSQLGenerator):
             rule_parser=self._parse_llm_response,
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
-            n=sampling_budget
+            n=sampling_budget,
+            trace_label="sql_generation.skeleton",
+        )
+
+        # 记录解析出的最终 SQL 列表
+        trace_event(
+            "generator_parse",
+            generator="skeleton",
+            candidate_count=len(all_sql_candidates),
+            candidates=all_sql_candidates,
         )
         
         return all_sql_candidates, total_token_usage

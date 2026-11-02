@@ -166,7 +166,7 @@ def _benchmark_selection_scan(db_path: str, iterations: int, filter_top_k_sql: i
         runner._execution_service = service
         runner._stage_config = SimpleNamespace(filter_top_k_sql=filter_top_k_sql)
         start_time = time.perf_counter()
-        top_k = runner._get_top_k_sql_candidates(item)
+        top_k, _ = runner._get_top_k_sql_candidates(item)
         cold_samples.append((time.perf_counter() - start_time) * 1000)
         cold_execute_calls.append(service.execute_calls)
         cold_measure_calls.append(service.measure_calls)
@@ -266,7 +266,7 @@ def run_snapshot_selection_benchmark(snapshot_path: str, sample_size: int, filte
         runner._execution_service = service
         runner._stage_config = SimpleNamespace(filter_top_k_sql=filter_top_k_sql)
         start_time = time.perf_counter()
-        top_k = runner._get_top_k_sql_candidates(item)
+        top_k, _ = runner._get_top_k_sql_candidates(item)
         durations.append((time.perf_counter() - start_time) * 1000)
         execute_calls.append(service.execute_calls)
         measure_calls.append(service.measure_calls)

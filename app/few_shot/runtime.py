@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from app.few_shot.masker import TargetMaskResult, mask_target_question_sql
 from app.few_shot.retriever import FewShotRetriever
 from app.llm import LLM
+from app.tracing import trace_event
 
 
 @dataclass
@@ -91,6 +92,16 @@ def prepare_few_shot_examples_for_item(
     skip_mask_llm: bool = False,
     llm_timeout: int = 300,
 ) -> PreparedFewShotExamples:
+    item_id = data_item.get_item_id() if hasattr(data_item, "get_item_id") else None
+    trace_event(
+        "few_shot_prepare_start",
+        item_id=item_id,
+        top_k=top_k,
+        question_weight=question_weight,
+        sql_weight=sql_weight,
+        preliminary_sql=preliminary_sql,
+        skip_mask_llm=skip_mask_llm,
+    )
     mask_result = _get_or_create_target_mask(
         data_item=data_item,
         preliminary_sql=preliminary_sql,
@@ -99,12 +110,44 @@ def prepare_few_shot_examples_for_item(
         skip_mask_llm=skip_mask_llm,
         llm_timeout=llm_timeout,
     )
+    trace_event(
+        "few_shot_mask",
+        item_id=item_id,
+        source=mask_result.source,
+        masked_question=mask_result.masked_question,
+        masked_sql=mask_result.masked_sql,
+    )
     retrieval_results = retriever.retrieve_by_texts(
         masked_question=mask_result.masked_question,
         masked_sql=mask_result.masked_sql,
         top_k=top_k,
         question_weight=question_weight,
         sql_weight=sql_weight,
+    )
+    trace_event(
+        "few_shot_retrieve",
+        item_id=item_id,
+        top_k=top_k,
+        question_weight=question_weight,
+        sql_weight=sql_weight,
+        retrieved_count=len(retrieval_results),
+        examples=[
+            {
+                "rank": result.rank,
+                "index": result.index,
+                "example_id": result.example.get("example_id"),
+                "dataset": result.example.get("dataset"),
+                "db_id": result.example.get("db_id"),
+                "question": result.example.get("question"),
+                "sql": result.example.get("sql"),
+                "retrieval_score": result.score,
+                "question_score": result.question_score,
+                "sql_score": result.sql_score,
+                "masked_question": result.example.get("masked_question"),
+                "masked_sql": result.example.get("masked_sql"),
+            }
+            for result in retrieval_results
+        ],
     )
     examples = [
         {
@@ -121,6 +164,13 @@ def prepare_few_shot_examples_for_item(
         }
         for result in retrieval_results
     ]
+    trace_event(
+        "few_shot_prepare_end",
+        item_id=item_id,
+        example_count=len(examples),
+        mask_source=mask_result.source,
+        used_sql_similarity=mask_result.masked_sql is not None,
+    )
     return PreparedFewShotExamples(
         examples=examples,
         masked_question=mask_result.masked_question,

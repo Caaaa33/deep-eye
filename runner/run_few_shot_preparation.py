@@ -19,6 +19,7 @@ from app.few_shot.runtime import (
 from app.llm import LLM
 from app.logger import configure_logger, logger
 from app.progress import log_progress, should_checkpoint
+from app.tracing import configure_tracing, submit_with_trace, trace_event, trace_scope
 
 
 def main() -> None:
@@ -78,6 +79,7 @@ def main() -> None:
     input_path = args.input_path or default_input_path
     output_path = args.output_path or few_shot_config.prepared_save_path
     index_path = args.index_path or few_shot_config.save_path
+    configure_tracing(Path(output_path).parent / "trace", stage="few_shot_preparation")
 
     load_path = output_path if Path(output_path).exists() and not args.force else input_path
     logger.info(f"Loading dataset for few-shot preparation from {load_path}")
@@ -134,52 +136,53 @@ def main() -> None:
         items_to_process.append(data_item)
 
     def prepare_item(data_item):
-        preliminary_sql = get_preliminary_sql_for_item(data_item, preliminary_sql_map)
-        preliminary_sql_source = "map" if preliminary_sql is not None else None
-        preliminary_sql_metadata = {
-            "source": preliminary_sql_source,
-            "selected": preliminary_sql is not None,
-        }
-        if preliminary_sql is None and preliminary_sql_generator is not None:
-            preliminary_result = preliminary_sql_generator.generate(data_item)
-            preliminary_sql = preliminary_result.sql
-            preliminary_sql_source = "generated" if preliminary_sql is not None else None
+        with trace_scope(item_id=data_item.get_item_id()):
+            preliminary_sql = get_preliminary_sql_for_item(data_item, preliminary_sql_map)
+            preliminary_sql_source = "map" if preliminary_sql is not None else None
             preliminary_sql_metadata = {
-                "source": "generated",
+                "source": preliminary_sql_source,
                 "selected": preliminary_sql is not None,
-                "candidate_count": len(preliminary_result.candidates),
-                "executable_candidate_count": preliminary_result.executable_candidates,
-                "non_empty_candidate_count": preliminary_result.non_empty_candidates,
-                "consistency_score": preliminary_result.consistency_score,
-                "token_usage": preliminary_result.token_usage,
             }
-            logger.info(
-                f"[few_shot_preparation][item {data_item.get_item_id()}] "
-                f"preliminary SQL generated "
-                f"(candidates={len(preliminary_result.candidates)}, "
-                f"executable={preliminary_result.executable_candidates}, "
-                f"non_empty={preliminary_result.non_empty_candidates}, "
-                f"consistency={preliminary_result.consistency_score:.3f}, "
-                f"selected={preliminary_sql is not None})"
+            if preliminary_sql is None and preliminary_sql_generator is not None:
+                preliminary_result = preliminary_sql_generator.generate(data_item)
+                preliminary_sql = preliminary_result.sql
+                preliminary_sql_source = "generated" if preliminary_sql is not None else None
+                preliminary_sql_metadata = {
+                    "source": "generated",
+                    "selected": preliminary_sql is not None,
+                    "candidate_count": len(preliminary_result.candidates),
+                    "executable_candidate_count": preliminary_result.executable_candidates,
+                    "non_empty_candidate_count": preliminary_result.non_empty_candidates,
+                    "consistency_score": preliminary_result.consistency_score,
+                    "token_usage": preliminary_result.token_usage,
+                }
+                logger.info(
+                    f"[few_shot_preparation][item {data_item.get_item_id()}] "
+                    f"preliminary SQL generated "
+                    f"(candidates={len(preliminary_result.candidates)}, "
+                    f"executable={preliminary_result.executable_candidates}, "
+                    f"non_empty={preliminary_result.non_empty_candidates}, "
+                    f"consistency={preliminary_result.consistency_score:.3f}, "
+                    f"selected={preliminary_sql is not None})"
+                )
+            prepared = prepare_few_shot_examples_for_item(
+                data_item=data_item,
+                retriever=retriever,
+                llm=llm,
+                top_k=few_shot_config.num_examples,
+                question_weight=few_shot_config.question_weight,
+                sql_weight=few_shot_config.sql_weight,
+                preliminary_sql=preliminary_sql,
+                cache=cache,
+                skip_mask_llm=args.skip_mask_llm,
+                llm_timeout=app_config.run_config.llm_timeout,
             )
-        prepared = prepare_few_shot_examples_for_item(
-            data_item=data_item,
-            retriever=retriever,
-            llm=llm,
-            top_k=few_shot_config.num_examples,
-            question_weight=few_shot_config.question_weight,
-            sql_weight=few_shot_config.sql_weight,
-            preliminary_sql=preliminary_sql,
-            cache=cache,
-            skip_mask_llm=args.skip_mask_llm,
-            llm_timeout=app_config.run_config.llm_timeout,
-        )
-        return {
-            "preliminary_sql": preliminary_sql,
-            "preliminary_sql_source": preliminary_sql_source,
-            "preliminary_sql_metadata": preliminary_sql_metadata,
-            "prepared": prepared,
-        }
+            return {
+                "preliminary_sql": preliminary_sql,
+                "preliminary_sql_source": preliminary_sql_source,
+                "preliminary_sql_metadata": preliminary_sql_metadata,
+                "prepared": prepared,
+            }
 
     def apply_result(data_item, result):
         prepared = result["prepared"]
@@ -191,6 +194,18 @@ def main() -> None:
             "used_sql_similarity": prepared.masked_sql is not None,
             "retrieved_example_count": len(prepared.examples),
         }
+        trace_event(
+            "few_shot_apply",
+            item_id=data_item.get_item_id(),
+            few_shot_example_count=len(prepared.examples),
+            preliminary_sql=result["preliminary_sql"],
+            preliminary_sql_source=result["preliminary_sql_source"],
+            preliminary_sql_metadata=result["preliminary_sql_metadata"],
+            target_mask_source=prepared.mask_source,
+            used_sql_similarity=prepared.masked_sql is not None,
+            masked_question=prepared.masked_question,
+            masked_sql=prepared.masked_sql,
+        )
         logger.info(
             f"[few_shot_preparation][item {data_item.get_item_id()}] "
             f"prepared {len(prepared.examples)} examples "
@@ -224,7 +239,7 @@ def main() -> None:
         else:
             with ThreadPoolExecutor(max_workers=item_parallel) as executor:
                 future_to_item = {
-                    executor.submit(prepare_item, data_item): data_item
+                    submit_with_trace(executor, prepare_item, data_item): data_item
                     for data_item in items_to_process
                 }
                 for future in tqdm(as_completed(future_to_item), total=len(future_to_item), desc="Few-shot Preparation"):

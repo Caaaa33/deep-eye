@@ -6,6 +6,7 @@ from app.logger import logger
 from app.prompt import PromptFactory
 from app.db_utils import map_lower_table_name_to_original_table_name, map_lower_column_name_to_original_column_name
 from app.services import get_schema_service
+from app.tracing import trace_event
 from typing import Dict, List, Optional, Any
 import re
 
@@ -14,6 +15,14 @@ class DirectLinker(BaseSchemaLinker):
     
     def link(self, data_item: DataItem, llm: LLM, sampling_budget: int = 1) -> tuple[Dict[str, List[str]], Dict[str, int]]:
         if sampling_budget == 0:
+            trace_event(
+                "schema_link_result",
+                linker="direct",
+                source="linker",
+                skipped=True,
+                reason="sampling_budget_zero",
+                sampling_budget=sampling_budget,
+            )
             return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         db_type = getattr(data_item, "db_type", None)
@@ -37,6 +46,15 @@ class DirectLinker(BaseSchemaLinker):
             logger.warning(f"Prompt for item {data_item.question_id} was too large. Compressed using level {level_idx}")
         if final_prompt is None:
             logger.error(f"CRITICAL: Even minimal prompt for item {data_item.question_id} exceeds token limit. Returning empty result.")
+            trace_event(
+                "schema_link_result",
+                linker="direct",
+                source="linker",
+                failed=True,
+                reason="prompt_exceeds_token_limit",
+                sampling_budget=sampling_budget,
+                prompt_level=level_idx,
+            )
             return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         extractor = self._get_extractor()
@@ -47,10 +65,27 @@ class DirectLinker(BaseSchemaLinker):
             parser_kwargs={"database_schema": data_item.database_schema_after_value_retrieval},
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
-            n=sampling_budget
+            n=sampling_budget,
+            trace_label="schema_linking.direct",
         )
         
-        return merge_schema_linking_results(all_selections), total_token_usage
+        merged_selections = merge_schema_linking_results(all_selections)
+        # 记录 prompt 压缩等级、采样预算与选择结果
+        trace_event(
+            "schema_link_result",
+            linker="direct",
+            source="linker",
+            sampling_budget=sampling_budget,
+            raw_selection_count=len(all_selections),
+            prompt_level=level_idx,
+            prompt_length=len(final_prompt),
+            prompt=final_prompt,
+            tables=merged_selections,
+            table_count=len(merged_selections),
+            column_count=sum(len(columns) for columns in merged_selections.values()),
+            token_usage=total_token_usage,
+        )
+        return merged_selections, total_token_usage
     
     def _parse_llm_response(self, response: str, database_schema: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
         try:

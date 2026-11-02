@@ -7,6 +7,7 @@ from app.prompt import PromptFactory
 from app.db_utils import map_lower_table_name_to_original_table_name, map_lower_column_name_to_original_column_name
 from app.few_shot import get_few_shot_examples_for_item
 from app.services import get_schema_service
+from app.tracing import trace_event
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 import re
@@ -49,6 +50,14 @@ class ReversedLinker(BaseSchemaLinker):
     
     def link(self, data_item: DataItem, llm: LLM, sampling_budget: int = 1) -> tuple[Dict[str, List[str]], Dict[str, int]]:
         if sampling_budget == 0:
+            trace_event(
+                "schema_link_result",
+                linker="reversed",
+                source="linker",
+                skipped=True,
+                reason="sampling_budget_zero",
+                sampling_budget=sampling_budget,
+            )
             return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         few_shot_examples, few_shot_source = self._get_few_shot_examples(data_item)
@@ -80,6 +89,17 @@ class ReversedLinker(BaseSchemaLinker):
             logger.warning(f"Reversed Prompt for item {data_item.question_id} was too large. Compressed using level {level_idx}")
         if final_prompt is None:
             logger.error(f"CRITICAL: Even minimal reversed prompt for item {data_item.question_id} exceeds token limit. Returning empty result.")
+            trace_event(
+                "schema_link_result",
+                linker="reversed",
+                source="linker",
+                failed=True,
+                reason="prompt_exceeds_token_limit",
+                sampling_budget=sampling_budget,
+                prompt_level=level_idx,
+                few_shot_count=len(few_shot_examples),
+                few_shot_source=few_shot_source,
+            )
             return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         # Define a combined parser that parses SQL then extracts tables/columns
@@ -102,10 +122,30 @@ class ReversedLinker(BaseSchemaLinker):
             parser_kwargs={"database_schema": data_item.database_schema_after_value_retrieval},
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
-            n=sampling_budget
+            n=sampling_budget,
+            trace_label="schema_linking.reversed",
         )
         
-        return merge_schema_linking_results(all_selections), total_token_usage
+        merged_selections = merge_schema_linking_results(all_selections)
+        # 记录 few-shot 来源、prompt 压缩等级与选择结果
+        trace_event(
+            "schema_link_result",
+            linker="reversed",
+            source="linker",
+            sampling_budget=sampling_budget,
+            raw_selection_count=len(all_selections),
+            prompt_level=level_idx,
+            prompt_length=len(final_prompt),
+            prompt=final_prompt,
+            few_shot_count=len(few_shot_examples),
+            few_shot_source=few_shot_source,
+            fallback=False,
+            tables=merged_selections,
+            table_count=len(merged_selections),
+            column_count=sum(len(columns) for columns in merged_selections.values()),
+            token_usage=total_token_usage,
+        )
+        return merged_selections, total_token_usage
 
     def _link_with_dc_fallback(self, data_item: DataItem, llm: LLM, sampling_budget: int) -> tuple[Dict[str, List[str]], Dict[str, int]]:
         """
@@ -133,6 +173,16 @@ class ReversedLinker(BaseSchemaLinker):
             logger.warning(f"DC Fallback Prompt for item {data_item.question_id} was too large. Compressed using level {level_idx}")
         if final_prompt is None:
             logger.error(f"CRITICAL: Even minimal DC fallback prompt for item {data_item.question_id} exceeds token limit. Returning empty result.")
+            trace_event(
+                "schema_link_result",
+                linker="reversed",
+                source="linker",
+                failed=True,
+                reason="prompt_exceeds_token_limit",
+                sampling_budget=sampling_budget,
+                prompt_level=level_idx,
+                fallback=True,
+            )
             return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         # Define a combined parser that parses SQL then extracts tables/columns
@@ -155,10 +205,29 @@ class ReversedLinker(BaseSchemaLinker):
             parser_kwargs={"database_schema": data_item.database_schema_after_value_retrieval},
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
-            n=sampling_budget
+            n=sampling_budget,
+            trace_label="schema_linking.reversed",
         )
         
-        return merge_schema_linking_results(all_selections), total_token_usage
+        merged_selections = merge_schema_linking_results(all_selections)
+        # 记录 DC fallback 分支的执行细节
+        trace_event(
+            "schema_link_result",
+            linker="reversed",
+            source="linker",
+            sampling_budget=sampling_budget,
+            raw_selection_count=len(all_selections),
+            prompt_level=level_idx,
+            prompt_length=len(final_prompt),
+            prompt=final_prompt,
+            fallback=True,
+            reason="no_few_shot_examples",
+            tables=merged_selections,
+            table_count=len(merged_selections),
+            column_count=sum(len(columns) for columns in merged_selections.values()),
+            token_usage=total_token_usage,
+        )
+        return merged_selections, total_token_usage
     
     def _parse_llm_response(self, response: str) -> Optional[str]:
         try:

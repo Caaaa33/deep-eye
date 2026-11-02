@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from app.few_shot.train_loader import TrainingExample
 from app.llm import LLM
 from app.logger import logger
+from app.tracing import current_item_id, trace_event
 
 
 MASK_SYSTEM_PROMPT = {
@@ -200,20 +201,44 @@ def mask_training_example(
     llm_timeout: int = 300,
 ) -> MaskResult:
     if skip_llm:
-        return MaskResult(masked_question=example.question_context, masked_sql=example.sql, source="raw")
+        result = MaskResult(masked_question=example.question_context, masked_sql=example.sql, source="raw")
+        trace_event(
+            "mask_example_end",
+            example_id=example.example_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+        )
+        return result
 
     cache_key = make_mask_cache_key(example)
     if cache is not None:
         cached_result = cache.get(cache_key)
         if cached_result is not None:
-            return MaskResult(
+            result = MaskResult(
                 masked_question=cached_result.masked_question,
                 masked_sql=cached_result.masked_sql,
                 source="cache",
             )
+            trace_event(
+                "mask_example_end",
+                example_id=example.example_id,
+                source=result.source,
+                masked_question=result.masked_question,
+                masked_sql=result.masked_sql,
+            )
+            return result
 
     if llm is None:
-        return MaskResult(masked_question=example.question_context, masked_sql=example.sql, source="raw")
+        result = MaskResult(masked_question=example.question_context, masked_sql=example.sql, source="raw")
+        trace_event(
+            "mask_example_end",
+            example_id=example.example_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+        )
+        return result
 
     try:
         messages = [
@@ -230,6 +255,8 @@ def mask_training_example(
             messages=messages,
             system_message=MASK_SYSTEM_PROMPT,
             timeout=llm_timeout,
+            trace_label="few_shot.mask_example",
+            trace_extra={"example_id": example.example_id},
         )
         parsed = parse_mask_response(choices[0].content)
         result = MaskResult(
@@ -239,10 +266,27 @@ def mask_training_example(
         )
         if cache is not None:
             cache.append(cache_key, result)
+        trace_event(
+            "mask_example_end",
+            example_id=example.example_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+        )
         return result
     except Exception as exc:
         logger.warning(f"Failed to mask few-shot example {example.example_id}; using raw text for this run. Error: {exc}")
-        return MaskResult(masked_question=example.question_context, masked_sql=example.sql, source="fallback")
+        result = MaskResult(masked_question=example.question_context, masked_sql=example.sql, source="fallback")
+        trace_event(
+            "mask_example_end",
+            example_id=example.example_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+            degraded=True,
+            error=exc,
+        )
+        return result
 
 
 def mask_target_question_sql(
@@ -260,7 +304,16 @@ def mask_target_question_sql(
     question_context = f"{question}\nHint: {evidence}" if evidence else question
 
     if skip_llm or llm is None:
-        return TargetMaskResult(masked_question=question_context, masked_sql=sql, source="raw")
+        result = TargetMaskResult(masked_question=question_context, masked_sql=sql, source="raw")
+        trace_event(
+            "mask_target_end",
+            item_id=item_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+            degraded=False,
+        )
+        return result
 
     try:
         if sql:
@@ -271,23 +324,42 @@ def mask_target_question_sql(
                 llm=llm,
                 llm_timeout=llm_timeout,
             )
-            return TargetMaskResult(
+            result = TargetMaskResult(
                 masked_question=parsed["masked_question"],
                 masked_sql=parsed["masked_sql"],
                 source="llm",
             )
-
-        parsed_question = _ask_mask_question_only(
-            question=question,
-            evidence=evidence,
-            llm=llm,
-            llm_timeout=llm_timeout,
+        else:
+            parsed_question = _ask_mask_question_only(
+                question=question,
+                evidence=evidence,
+                llm=llm,
+                llm_timeout=llm_timeout,
+            )
+            result = TargetMaskResult(masked_question=parsed_question, masked_sql=None, source="llm")
+        trace_event(
+            "mask_target_end",
+            item_id=item_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+            degraded=False,
         )
-        return TargetMaskResult(masked_question=parsed_question, masked_sql=None, source="llm")
+        return result
     except Exception as exc:
         prefix = f" for item {item_id}" if item_id is not None else ""
         logger.warning(f"Failed to mask target question/SQL{prefix}; using raw text for this run. Error: {exc}")
-        return TargetMaskResult(masked_question=question_context, masked_sql=sql, source="fallback")
+        result = TargetMaskResult(masked_question=question_context, masked_sql=sql, source="fallback")
+        trace_event(
+            "mask_target_end",
+            item_id=item_id,
+            source=result.source,
+            masked_question=result.masked_question,
+            masked_sql=result.masked_sql,
+            degraded=True,
+            error=exc,
+        )
+        return result
 
 
 def _ask_mask_question_sql(question: str, evidence: str, sql: str, llm: LLM, llm_timeout: int) -> Dict[str, str]:
@@ -305,6 +377,8 @@ def _ask_mask_question_sql(question: str, evidence: str, sql: str, llm: LLM, llm
         messages=messages,
         system_message=MASK_SYSTEM_PROMPT,
         timeout=llm_timeout,
+        trace_label="few_shot.mask_target_sql",
+        trace_extra={"phase": "target_mask", "item_id": current_item_id()},
     )
     return parse_mask_response(choices[0].content)
 
@@ -323,6 +397,8 @@ def _ask_mask_question_only(question: str, evidence: str, llm: LLM, llm_timeout:
         messages=messages,
         system_message=MASK_SYSTEM_PROMPT,
         timeout=llm_timeout,
+        trace_label="few_shot.mask_target_question",
+        trace_extra={"phase": "target_mask", "item_id": current_item_id()},
     )
     return parse_question_only_mask_response(choices[0].content)
 

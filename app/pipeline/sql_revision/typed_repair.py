@@ -6,6 +6,7 @@ from app.dataset import DataItem
 from app.llm import LLM
 from app.logger import logger
 from app.services import get_execution_service
+from app.tracing import trace_event
 
 from .checkers.base import BaseChecker
 from .checkers.empty_operators import EMPTY_OPERATORS
@@ -278,17 +279,43 @@ class TypedRepairer(BaseChecker):
         sampling_budget: int = 1,
     ) -> Tuple[str, Dict[str, int]]:
         zero_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        item_id = data_item.get_item_id()
 
         # Block A: deterministic pre-screening (no execution, no LLM).
-        if not self._pre_screen(sql):
+        pre_screen_passed = self._pre_screen(sql)
+        trace_event(
+            "repair_pre_screen",
+            item_id=item_id,
+            sql=sql,
+            passed=pre_screen_passed,
+            action="keep_original" if not pre_screen_passed else "continue",
+        )
+        if not pre_screen_passed:
             return sql, zero_tokens
 
         # Block B: execute and classify.
         execution_result = get_execution_service().execute(data_item, sql)
         failure_class = classify_execution_result(execution_result)
+        trace_event(
+            "repair_classify",
+            item_id=item_id,
+            sql=sql,
+            result_type=execution_result.result_type,
+            failure_class=failure_class,
+            diagnostic=_build_diagnostic(failure_class, execution_result),
+            error_message=execution_result.error_message,
+            execution_time=execution_result.execution_time,
+            row_count=len(execution_result.result_rows) if execution_result.result_rows is not None else None,
+        )
 
         if failure_class == "clean":
             final_sql, tokens = sql, zero_tokens
+            trace_event(
+                "repair_decision",
+                item_id=item_id,
+                action="skip_repair_clean",
+                final_sql=final_sql,
+            )
         else:
             # Block C: failure-aware repair (empty first tries deterministic ops).
             final_sql, tokens = self._repair(
@@ -298,6 +325,15 @@ class TypedRepairer(BaseChecker):
         # Projection normalization (noise reduction) guarded by re-execution.
         final_sql = self._apply_projection_normalization(final_sql, data_item)
 
+        trace_event(
+            "repair_candidate_result",
+            item_id=item_id,
+            input_sql=sql,
+            final_sql=final_sql,
+            changed=final_sql != sql,
+            failure_class=failure_class,
+            token_usage=tokens,
+        )
         return final_sql, tokens
 
     def _pre_screen(self, sql: str) -> bool:
@@ -328,18 +364,51 @@ class TypedRepairer(BaseChecker):
         execution_result,
     ) -> Tuple[str, Dict[str, int]]:
         zero_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        item_id = data_item.get_item_id()
 
         # empty: try deterministic operators before escalating to the LLM.
         if failure_class == "empty":
-            for operator in EMPTY_OPERATORS:
+            for operator_idx, operator in enumerate(EMPTY_OPERATORS):
+                operator_name = getattr(operator, "__name__", repr(operator))
                 try:
                     candidate = operator(sql, data_item)
-                except Exception:
+                except Exception as exc:
+                    trace_event(
+                        "repair_empty_operator",
+                        item_id=item_id,
+                        operator_index=operator_idx,
+                        operator=operator_name,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                        accepted=False,
+                    )
                     continue
                 if candidate and candidate != sql:
                     result = get_execution_service().execute(data_item, candidate)
-                    if result.result_type == "success":
+                    accepted = result.result_type == "success"
+                    trace_event(
+                        "repair_empty_operator",
+                        item_id=item_id,
+                        operator_index=operator_idx,
+                        operator=operator_name,
+                        candidate_sql=candidate,
+                        result_type=result.result_type,
+                        error_message=result.error_message,
+                        row_count=len(result.result_rows) if result.result_rows is not None else None,
+                        accepted=accepted,
+                    )
+                    if accepted:
                         return candidate, zero_tokens
+                else:
+                    trace_event(
+                        "repair_empty_operator",
+                        item_id=item_id,
+                        operator_index=operator_idx,
+                        operator=operator_name,
+                        candidate_sql=candidate,
+                        skipped_reason="empty_or_unchanged",
+                        accepted=False,
+                    )
 
         diagnostic = _build_diagnostic(failure_class, execution_result)
         prompt_template = _PROMPT_BY_CLASS[failure_class]
@@ -357,6 +426,15 @@ class TypedRepairer(BaseChecker):
             data_item, llm, prompt_format_func
         )
 
+        trace_event(
+            "repair_prompt_built",
+            item_id=item_id,
+            failure_class=failure_class,
+            diagnostic=diagnostic,
+            prompt_available=final_prompt is not None,
+            prompt_length=len(final_prompt) if final_prompt else 0,
+        )
+
         if final_prompt is None:
             logger.error(
                 f"CRITICAL: Even minimal typed-repair prompt for item {data_item.question_id} "
@@ -372,9 +450,27 @@ class TypedRepairer(BaseChecker):
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
             n=sampling_budget,
+            trace_label=f"sql_revision.typed_repair.{failure_class}",
+            trace_extra={"input_sql": sql, "failure_class": failure_class, "diagnostic": diagnostic},
+        )
+
+        trace_event(
+            "repair_candidates",
+            item_id=item_id,
+            failure_class=failure_class,
+            candidate_count=len(all_sql_candidates),
+            candidates=all_sql_candidates,
         )
 
         selected_sql = self._select_clean_candidate(all_sql_candidates, data_item)
+        trace_event(
+            "repair_select",
+            item_id=item_id,
+            failure_class=failure_class,
+            candidate_count=len(all_sql_candidates),
+            selected_sql=selected_sql,
+            fallback_to_original=selected_sql is None,
+        )
         if selected_sql:
             return selected_sql, total_token_usage
 
@@ -388,14 +484,34 @@ class TypedRepairer(BaseChecker):
         """Apply projection normalization, keeping it only when still clean."""
         if not sql:
             return sql
+        item_id = data_item.get_item_id()
         # 1) Drop numeric-suffix duplicate columns (Email2/Email3)
         normalized = normalize_projection(sql)
         # 2) Reorder columns into canonical bundles (SIRIUS column-bundle ordering)
         normalized = reorder_projection(normalized)
         if normalized == sql:
+            trace_event(
+                "repair_projection_normalize",
+                item_id=item_id,
+                input_sql=sql,
+                changed=False,
+                adopted=False,
+            )
             return sql
         result = get_execution_service().execute(data_item, normalized)
-        if result.result_type == "success":
+        adopted = result.result_type == "success"
+        trace_event(
+            "repair_projection_normalize",
+            item_id=item_id,
+            input_sql=sql,
+            normalized_sql=normalized,
+            changed=True,
+            adopted=adopted,
+            result_type=result.result_type,
+            error_message=result.error_message,
+            final_sql=normalized if adopted else sql,
+        )
+        if adopted:
             return normalized
         return sql
 
@@ -415,6 +531,7 @@ class TypedRepairer(BaseChecker):
         if not sql_candidates:
             return None, zero_tokens
 
+        item_id = data_item.get_item_id()
         execution_service = get_execution_service()
         unresolved: List[Tuple[str, str, str]] = []
         for sql in sql_candidates:
@@ -422,9 +539,24 @@ class TypedRepairer(BaseChecker):
                 continue
             result = execution_service.execute(data_item, sql)
             failure_class = classify_execution_result(result)
+            diagnostic = _build_diagnostic(failure_class, result)
+            trace_event(
+                "recovery_pool_check",
+                item_id=item_id,
+                sql=sql,
+                result_type=result.result_type,
+                failure_class=failure_class,
+                diagnostic=diagnostic,
+            )
             if failure_class == "clean":
+                trace_event(
+                    "recovery_skipped",
+                    item_id=item_id,
+                    reason="clean_candidate_in_pool",
+                    clean_sql=sql,
+                )
                 return None, zero_tokens
-            unresolved.append((sql, failure_class, _build_diagnostic(failure_class, result)))
+            unresolved.append((sql, failure_class, diagnostic))
 
         if not unresolved:
             return None, zero_tokens
@@ -439,7 +571,16 @@ class TypedRepairer(BaseChecker):
         sampling_budget: int,
     ) -> Tuple[Optional[str], Dict[str, int]]:
         zero_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        item_id = data_item.get_item_id()
         feedback = self._format_failure_feedback(unresolved)
+
+        trace_event(
+            "recovery_start",
+            item_id=item_id,
+            unresolved_count=len(unresolved),
+            unresolved=[{"sql": sql, "failure_class": cls, "diagnostic": diag} for sql, cls, diag in unresolved],
+            feedback=feedback,
+        )
 
         def prompt_format_func(schema_profile: str) -> str:
             return _RECOVERY_PROMPT.format(
@@ -451,6 +592,12 @@ class TypedRepairer(BaseChecker):
 
         final_prompt, _ = self._check_and_revise_with_progressive_stripping(
             data_item, llm, prompt_format_func
+        )
+        trace_event(
+            "recovery_prompt_built",
+            item_id=item_id,
+            prompt_available=final_prompt is not None,
+            prompt_length=len(final_prompt) if final_prompt else 0,
         )
         if final_prompt is None:
             logger.error(
@@ -467,9 +614,25 @@ class TypedRepairer(BaseChecker):
             fix_end_token=llm.llm_config.fix_end_token,
             end_token="</result>",
             n=sampling_budget,
+            trace_label="sql_revision.pool_recovery",
+            trace_extra={"unresolved_count": len(unresolved), "feedback": feedback},
+        )
+
+        trace_event(
+            "recovery_candidates",
+            item_id=item_id,
+            candidate_count=len(all_sql_candidates),
+            candidates=all_sql_candidates,
         )
 
         selected_sql = self._select_clean_candidate(all_sql_candidates, data_item)
+        trace_event(
+            "recovery_select",
+            item_id=item_id,
+            candidate_count=len(all_sql_candidates),
+            selected_sql=selected_sql,
+            success=selected_sql is not None,
+        )
         if selected_sql:
             return selected_sql, total_token_usage
 
@@ -489,15 +652,37 @@ class TypedRepairer(BaseChecker):
     def _select_clean_candidate(self, all_sql_candidates: List[str], data_item: DataItem) -> Optional[str]:
         """Pick the majority clean candidate (result_type == 'success'), else None."""
         execution_service = get_execution_service()
+        item_id = data_item.get_item_id()
         valid_candidates = []
         for sql_candidate in all_sql_candidates:
             execution_result = execution_service.execute(data_item, sql_candidate)
-            if execution_result.result_type == "success":
+            is_clean = execution_result.result_type == "success"
+            result_hash = None
+            if is_clean:
                 result_hash = execution_service.hash_result(data_item, execution_result.result_rows)
                 valid_candidates.append((sql_candidate, result_hash))
+            trace_event(
+                "repair_execute_candidate",
+                item_id=item_id,
+                sql=sql_candidate,
+                result_type=execution_result.result_type,
+                error_message=execution_result.error_message,
+                row_count=len(execution_result.result_rows) if execution_result.result_rows is not None else None,
+                result_hash=result_hash,
+                counted_as_clean=is_clean,
+            )
 
         if len(valid_candidates) == 0:
             return None
 
         counter = Counter(result_hash for _, result_hash in valid_candidates)
-        return max(valid_candidates, key=lambda x: counter[x[1]])[0]
+        selected_sql = max(valid_candidates, key=lambda x: counter[x[1]])[0]
+        trace_event(
+            "repair_candidate_votes",
+            item_id=item_id,
+            candidate_count=len(all_sql_candidates),
+            clean_count=len(valid_candidates),
+            result_hash_votes={str(hash_value): count for hash_value, count in counter.items()},
+            selected_sql=selected_sql,
+        )
+        return selected_sql

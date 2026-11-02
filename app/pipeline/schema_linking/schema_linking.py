@@ -12,6 +12,7 @@ import time
 import traceback
 from pathlib import Path
 from app.services import ArtifactStore, STAGE_ARTIFACT_FIELDS, configure_schema_service, load_stage_dataset, reset_schema_service
+from app.tracing import configure_tracing, submit_with_trace, trace_event, trace_scope
 
 class SchemaLinkingRunner:
     
@@ -80,6 +81,9 @@ class SchemaLinkingRunner:
             extractor_max_retry=self._extractor_max_retry,
         )
 
+        # 初始化执行追踪，事件落到 snapshot 同级的 trace 目录
+        configure_tracing(Path(self._stage_config.save_path).parent / "trace", stage="schema_linking")
+
     @classmethod
     def from_config(cls, app_config=None) -> "SchemaLinkingRunner":
         if app_config is None:
@@ -105,12 +109,31 @@ class SchemaLinkingRunner:
         
         # Track token usage for this specific data item
         total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        # 记录输入 schema 规模与 linker 配置
+        input_schema = data_item.database_schema_after_value_retrieval or {}
+        input_tables = input_schema.get("tables", {})
+        trace_event(
+            "schema_link_start",
+            question_id=data_item.question_id,
+            question=data_item.question,
+            evidence=data_item.evidence,
+            db_id=data_item.database_id,
+            input_table_count=len(input_tables),
+            input_column_count=sum(len(table.get("columns", {})) for table in input_tables.values()),
+            input_tables=list(input_tables.keys()),
+            linkers=["direct", "reversed", "value"],
+            direct_sampling_budget=self._stage_config.direct_linking_sampling_budget,
+            reversed_sampling_budget=self._stage_config.reversed_linking_sampling_budget,
+            value_distance_threshold=self._stage_config.value_distance_threshold,
+        )
         
         # Parallelize different linking methods within a single data item
+        linker_start_time = time.time()
         linker_tasks = {
-            "direct": self._inner_thread_pool_executor.submit(self._direct_linker.link, data_item, self._llm, self._stage_config.direct_linking_sampling_budget),
-            "reversed": self._inner_thread_pool_executor.submit(self._reversed_linker.link, data_item, self._llm, self._stage_config.reversed_linking_sampling_budget),
-            "value": self._inner_thread_pool_executor.submit(self._value_linker.link, data_item, self._llm)
+            "direct": submit_with_trace(self._inner_thread_pool_executor, self._direct_linker.link, data_item, self._llm, self._stage_config.direct_linking_sampling_budget),
+            "reversed": submit_with_trace(self._inner_thread_pool_executor, self._reversed_linker.link, data_item, self._llm, self._stage_config.reversed_linking_sampling_budget),
+            "value": submit_with_trace(self._inner_thread_pool_executor, self._value_linker.link, data_item, self._llm)
         }
         
         results = {}
@@ -122,6 +145,20 @@ class SchemaLinkingRunner:
                 traceback.print_exc()
                 # Set to None instead of empty dict to indicate failure
                 results[name] = (None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+
+            # 逐 linker 记录选中结果
+            linked_result, linker_tokens = results[name]
+            trace_event(
+                "schema_link_result",
+                linker=name,
+                source="runner",
+                tables=linked_result,
+                table_count=len(linked_result) if linked_result else 0,
+                column_count=sum(len(columns) for columns in linked_result.values()) if linked_result else 0,
+                token_usage=linker_tokens,
+                failed=linked_result is None,
+                elapsed_s=round(time.time() - linker_start_time, 3),
+            )
 
         direct_linked_tables_and_columns, direct_tokens = results["direct"]
         reversed_linked_tables_and_columns, reversed_tokens = results["reversed"]
@@ -148,17 +185,59 @@ class SchemaLinkingRunner:
             data_item.value_linked_tables_and_columns = value_linked_tables_and_columns
             data_item.final_linked_tables_and_columns = None
             data_item.database_schema_after_schema_linking = None
+            trace_event(
+                "schema_link_merge",
+                skipped=True,
+                reason="linker_failed",
+                failed_linkers=failed_linkers,
+            )
         else:
             merged_linked_tables_and_columns = merge_schema_linking_results([
                 direct_linked_tables_and_columns, 
                 reversed_linked_tables_and_columns, 
                 value_linked_tables_and_columns
             ])
+            trace_event(
+                "schema_link_merge",
+                tables=merged_linked_tables_and_columns,
+                table_count=len(merged_linked_tables_and_columns),
+                column_count=sum(len(columns) for columns in merged_linked_tables_and_columns.values()),
+            )
             data_item.direct_linked_tables_and_columns = direct_linked_tables_and_columns
             data_item.reversed_linked_tables_and_columns = reversed_linked_tables_and_columns
             data_item.value_linked_tables_and_columns = value_linked_tables_and_columns
             data_item.final_linked_tables_and_columns = merged_linked_tables_and_columns
-            data_item.database_schema_after_schema_linking = filter_used_database_schema(data_item.database_schema_after_value_retrieval, merged_linked_tables_and_columns)
+            filtered_schema = filter_used_database_schema(data_item.database_schema_after_value_retrieval, merged_linked_tables_and_columns)
+            data_item.database_schema_after_schema_linking = filtered_schema
+            # 记录过滤后保留/丢弃的表与列
+            filtered_tables = filtered_schema.get("tables", {})
+            kept_columns = {
+                table_name: list(table_dict.get("columns", {}).keys())
+                for table_name, table_dict in filtered_tables.items()
+            }
+            dropped_columns = {
+                table_name: [
+                    column_name for column_name in columns
+                    if column_name not in filtered_tables[table_name].get("columns", {})
+                ]
+                for table_name, columns in merged_linked_tables_and_columns.items()
+                if table_name in filtered_tables
+            }
+            dropped_columns = {table_name: columns for table_name, columns in dropped_columns.items() if columns}
+            trace_event(
+                "schema_link_filter",
+                force_include_pks_and_fks=True,
+                merged_table_count=len(merged_linked_tables_and_columns),
+                merged_column_count=sum(len(columns) for columns in merged_linked_tables_and_columns.values()),
+                kept_table_count=len(filtered_tables),
+                kept_column_count=sum(len(columns) for columns in kept_columns.values()),
+                kept_columns=kept_columns,
+                dropped_tables=[
+                    table_name for table_name in merged_linked_tables_and_columns
+                    if table_name not in filtered_tables
+                ],
+                dropped_columns=dropped_columns,
+            )
         
         end_time = time.time()
         data_item.schema_linking_time = end_time - start_time
@@ -170,21 +249,43 @@ class SchemaLinkingRunner:
             "total_tokens": data_item.total_llm_cost["total_tokens"] + data_item.schema_linking_llm_cost["total_tokens"],
         }
         self._eval_schema_linking_recall(data_item)
+
+        # 记录最终 schema 规模
+        final_schema = data_item.database_schema_after_schema_linking or {}
+        final_tables = final_schema.get("tables", {})
+        trace_event(
+            "schema_link_end",
+            total_time=data_item.schema_linking_time,
+            final_table_count=len(final_tables),
+            final_column_count=sum(len(table.get("columns", {})) for table in final_tables.values()),
+            final_tables=list(final_tables.keys()),
+            final_linked_tables_and_columns=data_item.final_linked_tables_and_columns,
+            linkers_failed=data_item.final_linked_tables_and_columns is None,
+            token_usage=data_item.schema_linking_llm_cost,
+            total_llm_cost=data_item.total_llm_cost,
+            final_linking_recall=data_item.final_linking_recall,
+        )
         
     def _is_linking_complete(self, data_item: DataItem) -> bool:
         """Check if schema linking step completed successfully."""
         return data_item.is_stage_complete("schema_linking")
     
+    def _process_item(self, data_item: DataItem):
+        """单条 item 的处理入口：设置追踪上下文。"""
+        with trace_scope(item_id=data_item.get_item_id()):
+            self._link_tables_and_columns(data_item)
+
     def run(self):
         future_to_item = {}
         for data_item in self._dataset:
             if self._is_linking_complete(data_item):
                 # If already linked but recall is missing, evaluate it now
                 if data_item.get_stage_artifact("schema_linking").final_linking_recall is None:
-                    self._eval_schema_linking_recall(data_item)
+                    with trace_scope(item_id=data_item.get_item_id()):
+                        self._eval_schema_linking_recall(data_item)
                 logger.info(f"Skipping data item {data_item.question_id} because it has already been linked")
                 continue
-            future = self._thread_pool_executor.submit(self._link_tables_and_columns, data_item)
+            future = submit_with_trace(self._thread_pool_executor, self._process_item, data_item)
             future_to_item[future] = data_item
         for idx, future in tqdm(enumerate(as_completed(future_to_item), start=1), total=len(future_to_item), desc="Linking tables and columns"):
             future.result()
@@ -217,6 +318,16 @@ class SchemaLinkingRunner:
             data_item.reversed_linking_recall = default_recall
             data_item.value_linking_recall = default_recall
             data_item.final_linking_recall = default_recall
+            # 无 gold SQL 时仍逐方法记录一条跳过事件
+            for method in ("direct", "reversed", "value", "final"):
+                trace_event(
+                    "schema_link_recall",
+                    method=method,
+                    skipped=True,
+                    reason="no_gold_sql",
+                    table_recall=0.0,
+                    column_recall=0.0,
+                )
             return
 
         gold_tables_and_columns = self._reversed_linker._extract_tables_and_columns(data_item.gold_sql, data_item.database_schema_after_value_retrieval)
@@ -246,6 +357,46 @@ class SchemaLinkingRunner:
         data_item.reversed_linking_recall = {"table_recall": reversed_table_recall, "column_recall": reversed_column_recall}
         data_item.value_linking_recall = {"table_recall": value_table_recall, "column_recall": value_column_recall}
         data_item.final_linking_recall = {"table_recall": final_table_recall, "column_recall": final_column_recall}
+
+        # 记录逐方法的召回明细与命中的表/列
+        def _recall_detail(linked_tables_and_columns):
+            hit_tables = []
+            hit_columns = {}
+            for table_name, columns in (linked_tables_and_columns or {}).items():
+                if table_name in gold_tables_and_columns:
+                    hit_tables.append(table_name)
+                    matched_columns = [column_name for column_name in columns if column_name in gold_tables_and_columns[table_name]]
+                    if matched_columns:
+                        hit_columns[table_name] = matched_columns
+            return hit_tables, hit_columns
+
+        gold_table_count = len(gold_tables_and_columns.keys())
+        gold_column_count = sum(len(columns) for columns in gold_tables_and_columns.values())
+        recall_entries = {
+            "direct": (data_item.direct_linking_recall, data_item.direct_linked_tables_and_columns),
+            "reversed": (data_item.reversed_linking_recall, data_item.reversed_linked_tables_and_columns),
+            "value": (data_item.value_linking_recall, data_item.value_linked_tables_and_columns),
+            "final": (data_item.final_linking_recall, data_item.final_linked_tables_and_columns),
+        }
+        for method, (recall, linked) in recall_entries.items():
+            hit_tables, hit_columns = _recall_detail(linked)
+            trace_event(
+                "schema_link_recall",
+                method=method,
+                table_recall=recall["table_recall"],
+                column_recall=recall["column_recall"],
+                gold_table_count=gold_table_count,
+                gold_column_count=gold_column_count,
+                gold_tables=list(gold_tables_and_columns.keys()),
+                gold=gold_tables_and_columns,
+                linked=linked,
+                predicted_table_count=len(linked) if linked else 0,
+                predicted_column_count=sum(len(columns) for columns in linked.values()) if linked else 0,
+                hit_table_count=len(hit_tables),
+                hit_column_count=sum(len(columns) for columns in hit_columns.values()),
+                hit_tables=hit_tables,
+                hit_columns=hit_columns,
+            )
 
     
     def _clean_up(self):
