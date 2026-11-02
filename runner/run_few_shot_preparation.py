@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--enable_preliminary_sql", action="store_true", help="Force preliminary SQL generation when the map has no SQL for an item")
     parser.add_argument("--disable_preliminary_sql", action="store_true", help="Disable preliminary SQL generation even if config enables it")
     parser.add_argument("--max_items", type=int, default=None, help="Only process/save the first N items")
+    parser.add_argument("--item_ids", type=str, default=None, help="Comma-separated question ids to process (e.g. '5,42,133'). Takes precedence over --max_items.")
     parser.add_argument("--checkpoint_interval", type=int, default=None, help="Override [run].checkpoint_interval")
     parser.add_argument("--skip_mask_llm", action="store_true", help="Use raw question/preliminary SQL instead of LLM-masked text")
     parser.add_argument("--force", action="store_true", help="Ignore an existing output snapshot and rebuild all items")
@@ -81,7 +82,11 @@ def main() -> None:
     load_path = output_path if Path(output_path).exists() and not args.force else input_path
     logger.info(f"Loading dataset for few-shot preparation from {load_path}")
     dataset = load_dataset(load_path)
-    if args.max_items is not None:
+    if args.item_ids is not None:
+        wanted = {s.strip() for s in args.item_ids.split(",") if s.strip()}
+        dataset._data = [item for item in dataset._data if str(item.question_id) in wanted]
+        logger.info(f"Filtered few-shot preparation dataset to {len(dataset)} items by ids {sorted(wanted, key=int)}")
+    elif args.max_items is not None:
         dataset._data = dataset._data[: args.max_items]
         logger.info(f"Limited few-shot preparation dataset to first {len(dataset)} items")
 

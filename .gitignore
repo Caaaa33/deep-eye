@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Node.js
+node_modules/
+
 # vllm model commands
 .vllm_model_cmd
 
@@ -19,6 +22,7 @@ bak_workspace/
 gemini3_flash_on_qwen3_failed_workspace/
 *workspace*/
 logs/
+*.log
 
 # data
 data/
@@ -42,3 +46,5 @@ local_docs/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
+
+papers/
