@@ -274,10 +274,12 @@ class SQLRevisionConfig(BaseModel):
 
 class SQLSelectionConfig(BaseModel):
     llm: LLMConfig = Field(..., description="The llm config, used to select sql")
+    judge_llm: Optional[LLMConfig] = Field(default=None, description="Optional dedicated spectator/judge LLM for pairwise comparison; falls back to `llm` when unset")
     save_path: str = Field(default=_path_to_str(WORKSPACE_ROOT / "sql_selection"), description="The save path of the sql selection result")
     filter_top_k_sql: int = Field(default=2, description="The number of top k sql to filter")
-    evaluator_sampling_budget: int = Field(default=1, description="The sampling budget of the evaluator")
-    shortcut_consistency_score_threshold: float = Field(default=0.8, description="The threshold of the consistency score to shortcut")
+    evaluator_sampling_budget: int = Field(default=1, description="The sampling budget of the evaluator, per presentation order (each pair is judged in both A/B and B/A orders, so pairwise calls = 2 * this value)")
+    shortcut_consistency_score_threshold: float = Field(default=0.8, description="The threshold of the consistency score to shortcut (legacy absolute-threshold gating)")
+    shortcut_consistency_gap_threshold: float = Field(default=0.3, description="Deprecated/unused: pairwise comparison is now always run for >1 candidates; the confidence gate only decides whether Stage 2 structural support runs")
 
 
 class LLMExtractorConfig(BaseModel):
@@ -611,6 +613,22 @@ class Config:
         
         # sql selection config
         sql_selection_config = config.get("sql_selection", {})
+        # Optional dedicated judge model: only resolved when explicitly configured,
+        # otherwise the runner reuses the stage LLM (SIRIUS-style self-judge fallback).
+        judge_llm_config = None
+        if sql_selection_config.get("judge_llm_profile") or sql_selection_config.get("judge_llm"):
+            # Deliberately not merged with the generation model's defaults: a
+            # cross-vendor judge must not inherit Qwen-only fields such as
+            # extra_body={enable_thinking: ...}.
+            judge_llm_config = _resolve_llm_config(
+                None,
+                sql_selection_config.get("judge_llm"),
+                "[sql_selection].judge_llm",
+                required=True,
+                llm_profiles=llm_profiles_config,
+                default_profile=None,
+                section_profile=sql_selection_config.get("judge_llm_profile"),
+            )
         sql_selection_settings = {
             "llm": _resolve_llm_config(
                 default_llm_config,
@@ -621,6 +639,7 @@ class Config:
                 default_profile=default_llm_profile,
                 section_profile=sql_selection_config.get("llm_profile"),
             ),
+            "judge_llm": judge_llm_config,
             "save_path": _get_path_value(
                 sql_selection_config,
                 "save_path",
@@ -631,6 +650,7 @@ class Config:
             "filter_top_k_sql": sql_selection_config.get("filter_top_k_sql", 10),
             "evaluator_sampling_budget": sql_selection_config.get("evaluator_sampling_budget", 1),
             "shortcut_consistency_score_threshold": sql_selection_config.get("shortcut_consistency_score_threshold", 0.8),
+            "shortcut_consistency_gap_threshold": sql_selection_config.get("shortcut_consistency_gap_threshold", 0.3),
         }
         
         # llm extractor config (retry settings for parsing)

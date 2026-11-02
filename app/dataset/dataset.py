@@ -51,6 +51,7 @@ class DataItem(BaseModel):
     
     # SQL Revision Step
     sql_candidates_after_revision: Optional[List[str]] = Field(default=None, description="The sql candidates after revision of the data item")
+    sql_candidate_sources: Optional[List[str]] = Field(default=None, description="Provenance (generator/recovery label) of each revised sql candidate, aligned with sql_candidates_after_revision")
     
     # SQL Selection Step
     final_selected_sql: Optional[str] = Field(default=None, description="The final selected sql of the data item")

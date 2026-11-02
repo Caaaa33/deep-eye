@@ -419,28 +419,19 @@ Based on the question, database schemas, previous SQL query and modification sug
 
 SPIDER2_BR_PAIR_SELECTION_PROMPT = """
 # Task:
-Given the DB info and question, there are two candidate queries for a database (BigQuery, Snowflake, or SQLite). There is correct one and incorrect one, compare the two candidate answers, analyze the differences of the query and the result. Based on the original question and the provided database info, choose the correct one.
+Given the DB info, the question, and two candidate queries (BigQuery, Snowflake, or SQLite) together with their execution results, judge each query independently: does it answer the question correctly and completely?
 
-# Important Context:
-- SQL Candidate A (Top-1) has higher confidence than SQL Candidate B (Top-2)
-- SQL Candidate A's confidence was not high enough to meet the threshold, but it is still the more confident choice
-- You should only choose SQL Candidate B if there is clear evidence that it is superior to SQL Candidate A, or if SQL Candidate A has obvious errors
-- The default preference should be SQL Candidate A unless there are compelling reasons to choose SQL Candidate B
-- If you cannot determine which SQL is better, or if both SQLs have significant issues, you should choose SQL Candidate A by default
-
-# Instructions:
-- Carefully analyze the user question, database schema, and both candidate SQL queries
-- For each SQL, consider its logic, correctness, and the provided execution result
-- Compare the two SQLs in terms of their ability to answer the question accurately and completely
-- Give preference to SQL Candidate A unless SQL Candidate B clearly demonstrates superiority or SQL Candidate A has obvious flaws
-- In <result>, output 'A' or 'B' (just the letter/word):
-  - 'A': SQL Candidate A is clearly better
-  - 'B': SQL Candidate B is clearly better  
+# Judging Rules:
+- Label each query 'Correct' or 'Incorrect' on its own merits.
+- Judge the two queries independently. Do NOT assume exactly one of them is correct: both may be correct, and both may be incorrect.
+- The presentation order carries no information about quality. Never prefer a query because it is shown first.
+- A query is 'Incorrect' when its SQL logic does not answer the question, when it fails to execute, when its result misses or adds columns relative to what the question asks for (select only the columns the question requests), or when its rows do not reflect the requested filtering, aggregation, or ordering.
 
 # Output Format:
-Please respond with XML code structured as follows:
+Respond with the following XML only, labeling the two queries independently:
 <result>
-    A or B (just the letter/word)
+<sql1_judge>Correct or Incorrect</sql1_judge>
+<sql2_judge>Correct or Incorrect</sql2_judge>
 </result>
 
 # Input:
@@ -456,19 +447,19 @@ Please respond with XML code structured as follows:
 ## Question:
 {QUESTION}
 
-SQL Candidate A:
+SQL Query 1 (sql1):
 {QUERY_A}
 
-## Execution Result:
+## Execution Result of sql1:
 {RESULT_A}
 
-SQL Candidate B:
+SQL Query 2 (sql2):
 {QUERY_B}
 
-## Execution Result:
+## Execution Result of sql2:
 {RESULT_B}
 
-Based on the question and the two SQL queries, analyze which query answers the question correctly, and only output the XML code as your response.
+Based on the question, judge each of the two SQL queries independently, and only output the XML code as your response.
 
 # Output:
 """

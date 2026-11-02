@@ -53,12 +53,14 @@ class SchemaLinkingArtifact(BaseModel):
 
 class SQLGenerationArtifact(BaseModel):
     sql_candidates: Optional[List[str]] = Field(default=None)
+    sql_candidate_sources: Optional[List[str]] = Field(default=None)
     sql_generation_time: Optional[float] = Field(default=None)
     sql_generation_llm_cost: Optional[Dict[str, Any]] = Field(default=None)
 
 
 class SQLRevisionArtifact(BaseModel):
     sql_candidates_after_revision: Optional[List[str]] = Field(default=None)
+    sql_candidate_sources: Optional[List[str]] = Field(default=None)
     sql_revision_time: Optional[float] = Field(default=None)
     sql_revision_llm_cost: Optional[Dict[str, Any]] = Field(default=None)
 
@@ -115,11 +117,13 @@ STAGE_ARTIFACT_FIELDS = {
     ),
     "sql_generation": (
         "sql_candidates",
+        "sql_candidate_sources",
         "sql_generation_time",
         "sql_generation_llm_cost",
     ),
     "sql_revision": (
         "sql_candidates_after_revision",
+        "sql_candidate_sources",
         "sql_revision_time",
         "sql_revision_llm_cost",
     ),
