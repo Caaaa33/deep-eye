@@ -278,6 +278,7 @@ class SQLSelectionConfig(BaseModel):
     save_path: str = Field(default=_path_to_str(WORKSPACE_ROOT / "sql_selection"), description="The save path of the sql selection result")
     filter_top_k_sql: int = Field(default=2, description="The number of top k sql to filter")
     evaluator_sampling_budget: int = Field(default=1, description="The sampling budget of the evaluator, per presentation order (each pair is judged in both A/B and B/A orders, so pairwise calls = 2 * this value)")
+    ablation_arm: Optional[Literal["A", "B", "C", "D", "E", "F"]] = Field(default=None, description="L4 ablation: A/B old prompt, C/D new prompt, E majority only, F original L4; B/D use judge_llm")
     shortcut_consistency_score_threshold: float = Field(default=0.8, description="The threshold of the consistency score to shortcut (legacy absolute-threshold gating)")
     shortcut_consistency_gap_threshold: float = Field(default=0.3, description="Deprecated/unused: pairwise comparison is now always run for >1 candidates; the confidence gate only decides whether Stage 2 structural support runs")
 
@@ -649,6 +650,7 @@ class Config:
             ),
             "filter_top_k_sql": sql_selection_config.get("filter_top_k_sql", 10),
             "evaluator_sampling_budget": sql_selection_config.get("evaluator_sampling_budget", 1),
+            "ablation_arm": sql_selection_config.get("ablation_arm"),
             "shortcut_consistency_score_threshold": sql_selection_config.get("shortcut_consistency_score_threshold", 0.8),
             "shortcut_consistency_gap_threshold": sql_selection_config.get("shortcut_consistency_gap_threshold", 0.3),
         }

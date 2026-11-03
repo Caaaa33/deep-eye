@@ -64,7 +64,11 @@ class PromptFactory:
         return COMMON_CHECKER_PROMPT.format(DATABASE_SCHEMA=database_schema, QUESTION=question, HINT=hint, QUERY=sql, SUGGESTIONS=suggestions)
     
     @staticmethod
-    def format_br_pair_selection_prompt(database_schema: str, question: str, hint: str, query_a: str, result_a: str, query_b: str, result_b: str, db_type: Optional[str] = None) -> str:
+    def format_br_pair_selection_prompt(database_schema: str, question: str, hint: str, query_a: str, result_a: str, query_b: str, result_b: str, db_type: Optional[str] = None, prompt_version: str = "new") -> str:
+        if prompt_version not in ("old", "new"):
+            raise ValueError(f"Unknown pairwise prompt version: {prompt_version}")
         if _is_spider2_db_type(db_type):
-            return SPIDER2_BR_PAIR_SELECTION_PROMPT.format(DATABASE_SCHEMA=database_schema, QUESTION=question, HINT=hint, QUERY_A=query_a, RESULT_A=result_a, QUERY_B=query_b, RESULT_B=result_b, DATABASE_ENGINE=db_type.upper())
-        return BR_PAIR_SELECTION_PROMPT.format(DATABASE_SCHEMA=database_schema, QUESTION=question, HINT=hint, QUERY_A=query_a, RESULT_A=result_a, QUERY_B=query_b, RESULT_B=result_b)
+            template = SPIDER2_BR_PAIR_SELECTION_PROMPT_LEGACY if prompt_version == "old" else SPIDER2_BR_PAIR_SELECTION_PROMPT
+            return template.format(DATABASE_SCHEMA=database_schema, QUESTION=question, HINT=hint, QUERY_A=query_a, RESULT_A=result_a, QUERY_B=query_b, RESULT_B=result_b, DATABASE_ENGINE=db_type.upper())
+        template = BR_PAIR_SELECTION_PROMPT_LEGACY if prompt_version == "old" else BR_PAIR_SELECTION_PROMPT
+        return template.format(DATABASE_SCHEMA=database_schema, QUESTION=question, HINT=hint, QUERY_A=query_a, RESULT_A=result_a, QUERY_B=query_b, RESULT_B=result_b)

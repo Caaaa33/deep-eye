@@ -94,6 +94,7 @@ llm_profile = "qwen36_thinking"
 
 ########## SQL revision configuration ##########
 [sql_revision]
+enable_typed_repair = true
 checker_sampling_budget = 5
 llm_profile = "qwen36_thinking"
 
@@ -103,6 +104,22 @@ filter_top_k_sql = 2
 evaluator_sampling_budget = 5
 shortcut_consistency_score_threshold = 0.6
 llm_profile = "qwen36_thinking"
+# Six-arm L4 study: set ablation_arm = "A", "B", "C", "D", "E", or "F".
+# A/C use llm_profile as judge; B/D require the dedicated judge below.
+# E uses result-majority voting without a judge call.
+# F reproduces the original L4 using llm_profile as judge.
+# ablation_arm = "C"
+# judge_llm_profile = "deepseek_flash"
+
+# Add this profile under the other [llm_profiles.*] sections above when running B/D:
+# [llm_profiles.deepseek_flash]
+# model = "deepseek-flash"
+# base_url = "https://api.deepseek.com"
+# api_key = "your-deepseek-api-key"
+# max_tokens = 8192
+# temperature = 0.6
+# n_call_strategy = "split"
+# api_type = "openai"
 
 ########## LLM extractor configuration ##########
 [llm_extractor]

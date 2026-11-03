@@ -171,6 +171,31 @@ Based on the question, table schemas, the previous query, and the result signal,
 # Output:
 """
 
+_EMPTY_BASELINE_REWRITE_PROMPT = """
+# Task:
+Write a fresh SQL query for the question. The previous SQL is a negative example because it returned no useful rows.
+
+# Instructions:
+- Do not merely repeat the previous query or its restrictive predicates.
+- Re-read the question, evidence, and schema, then produce a complete alternative query.
+- Use the previous SQL and diagnosis only to avoid repeating the same failure.
+
+# Output Format:
+Return XML with a <result> tag containing only the SQL.
+
+# Input:
+## Database Schema:
+{DATABASE_SCHEMA}
+## Question:
+{QUESTION}
+## Hint:
+{HINT}
+## Previous SQL (negative example):
+{QUERY}
+## Diagnosis:
+{DIAGNOSTIC}
+"""
+
 
 _PROMPT_BY_CLASS = {
     "runtime": _RUNTIME_REPAIR_PROMPT,
@@ -282,12 +307,13 @@ class TypedRepairer(BaseChecker):
         item_id = data_item.get_item_id()
 
         # Block A: deterministic pre-screening (no execution, no LLM).
-        pre_screen_passed = self._pre_screen(sql)
+        sql, pre_screen_passed, validation_diagnostic = self.pre_screen_candidate(sql, data_item)
         trace_event(
             "repair_pre_screen",
             item_id=item_id,
             sql=sql,
             passed=pre_screen_passed,
+            diagnostic=validation_diagnostic,
             action="keep_original" if not pre_screen_passed else "continue",
         )
         if not pre_screen_passed:
@@ -337,22 +363,67 @@ class TypedRepairer(BaseChecker):
         return final_sql, tokens
 
     def _pre_screen(self, sql: str) -> bool:
-        """Reject obviously malformed SQL before executing it (zero LLM cost)."""
-        s = sql.strip()
-        leading = re.sub(r"^\s*(--[^\n]*\n|#[^\n]*\n)+", "", s).lstrip()
-        if not re.match(
-            r"^(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|DROP)\b",
-            leading,
-            re.IGNORECASE,
-        ):
-            return False
-        if leading.upper().startswith("SELECT") and "FROM" not in leading.upper():
-            return False
-        if leading.count("(") != leading.count(")"):
-            return False
-        if leading.count("'") % 2 != 0:
-            return False
-        return True
+        """Compatibility wrapper; full screening is exposed by pre_screen_candidate."""
+        return self._syntax_check(sql)[0]
+
+    @staticmethod
+    def _sanitize_sql(sql: str) -> str:
+        text = (sql or "").strip()
+        text = re.sub(r"^(?:\s*(?:--[^\n]*|\#[^\n]*)\n)+", "", text).lstrip()
+        text = re.sub(r"^SELECT\*", "SELECT *", text, flags=re.IGNORECASE)
+        return text
+
+    @staticmethod
+    def _syntax_check(sql: str) -> Tuple[bool, str]:
+        if not sql:
+            return False, "empty_sql"
+        leading = sql.lstrip()
+        if not re.match(r"^(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|DROP)\b", leading, re.IGNORECASE):
+            return False, "invalid_leading_keyword"
+        depth = 0
+        quote = None
+        i = 0
+        while i < len(leading):
+            char = leading[i]
+            if quote:
+                if char == quote:
+                    if i + 1 < len(leading) and leading[i + 1] == quote:
+                        i += 1
+                    else:
+                        quote = None
+            elif char in ("'", '"', '`'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0:
+                    return False, "unbalanced_parentheses"
+            i += 1
+        if quote:
+            return False, "unbalanced_quotes"
+        if depth:
+            return False, "unbalanced_parentheses"
+        if re.search(r",\s*(?:FROM|WHERE|GROUP\s+BY|ORDER\s+BY)\b", leading, re.IGNORECASE):
+            return False, "trailing_projection_or_clause_comma"
+        return True, "ok"
+
+    def pre_screen_candidate(self, sql: str, data_item: DataItem) -> Tuple[str, bool, str]:
+        """Sanitize and validate before any expensive execution or repair call."""
+        cleaned = self._sanitize_sql(sql)
+        valid, diagnostic = self._syntax_check(cleaned)
+        if not valid:
+            return cleaned, False, diagnostic
+
+        db_type = (getattr(data_item, "db_type", None) or "sqlite").lower()
+        if db_type in ("sqlite", "bird", "spider"):
+            try:
+                plan = get_execution_service().execute(data_item, f"EXPLAIN QUERY PLAN {cleaned}")
+                if plan.result_type not in ("success",):
+                    return cleaned, False, f"schema_validation:{plan.error_message or plan.result_type}"
+            except Exception as exc:
+                return cleaned, False, f"schema_validation:{type(exc).__name__}:{exc}"
+        return cleaned, True, "ok"
 
     def _repair(
         self,
@@ -474,11 +545,54 @@ class TypedRepairer(BaseChecker):
         if selected_sql:
             return selected_sql, total_token_usage
 
+        if failure_class == "empty":
+            def baseline_prompt(schema_profile: str) -> str:
+                return _EMPTY_BASELINE_REWRITE_PROMPT.format(
+                    DATABASE_SCHEMA=schema_profile,
+                    QUESTION=data_item.question,
+                    HINT=data_item.evidence,
+                    QUERY=sql,
+                    DIAGNOSTIC=diagnostic,
+                )
+
+            second_prompt, _ = self._check_and_revise_with_progressive_stripping(
+                data_item, llm, baseline_prompt
+            )
+            trace_event(
+                "repair_empty_round2_prompt_built",
+                item_id=item_id,
+                prompt_available=second_prompt is not None,
+                prompt_length=len(second_prompt) if second_prompt else 0,
+            )
+            if second_prompt is not None:
+                second_candidates, second_tokens = extractor.extract_with_retry(
+                    llm=llm,
+                    messages=[{"role": "user", "content": second_prompt}],
+                    rule_parser=self._parse_llm_response,
+                    fix_end_token=llm.llm_config.fix_end_token,
+                    end_token="</result>",
+                    n=1,
+                    trace_label="sql_revision.typed_repair.empty_round2",
+                    trace_extra={"input_sql": sql, "failure_class": failure_class},
+                )
+                for key in total_token_usage:
+                    total_token_usage[key] += second_tokens[key]
+                selected_sql = self._select_clean_candidate(second_candidates, data_item)
+                trace_event(
+                    "repair_empty_round2_result",
+                    item_id=item_id,
+                    candidates=second_candidates,
+                    selected_sql=selected_sql,
+                )
+                if selected_sql:
+                    return selected_sql, total_token_usage
+
         logger.warning(
             f"Typed repair ({failure_class}) produced no clean candidate for item "
-            f"{data_item.question_id}; keeping original SQL."
+            f"{data_item.question_id}; removing the unresolved candidate from the pool."
         )
-        return sql, total_token_usage
+        trace_event("repair_unresolved", item_id=item_id, sql=sql, failure_class=failure_class, diagnostic=diagnostic, action="remove_from_pool")
+        return None, total_token_usage
 
     def _apply_projection_normalization(self, sql: str, data_item: DataItem) -> str:
         """Apply projection normalization, keeping it only when still clean."""
@@ -521,6 +635,7 @@ class TypedRepairer(BaseChecker):
         sql_candidates: List[str],
         llm: LLM,
         sampling_budget: int = 1,
+        filtered_candidates: Optional[List[Tuple[str, str]]] = None,
     ) -> Tuple[Optional[str], Dict[str, int]]:
         """Regenerate one candidate when no candidate in the pool is clean.
 
@@ -528,13 +643,16 @@ class TypedRepairer(BaseChecker):
         already contains a clean candidate or recovery produced nothing clean.
         """
         zero_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        if not sql_candidates:
+        if not sql_candidates and not filtered_candidates:
             return None, zero_tokens
 
         item_id = data_item.get_item_id()
         execution_service = get_execution_service()
-        unresolved: List[Tuple[str, str, str]] = []
-        for sql in sql_candidates:
+        unresolved: List[Tuple[str, str, str]] = [
+            (sql, "validation", diagnostic)
+            for sql, diagnostic in (filtered_candidates or [])
+        ]
+        for sql in sql_candidates or []:
             if not sql:
                 continue
             result = execution_service.execute(data_item, sql)

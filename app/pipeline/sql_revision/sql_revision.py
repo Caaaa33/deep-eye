@@ -188,8 +188,9 @@ class SQLRevisionRunner:
             checker_sampling_budget=self._stage_config.checker_sampling_budget,
         )
         
-        # If sql_candidates is empty or None, skip revision and set result to None
-        if not sql_candidates:
+        # Keep the legacy empty-pool behavior when typed repair is disabled.
+        # With typed repair enabled, let pool recovery attempt a fresh candidate.
+        if not sql_candidates and not (self._enable_typed_repair and self._typed_repairer is not None):
             logger.error(f"sql_candidates is empty or None for item {data_item.question_id}, setting sql_candidates_after_revision to None")
             trace_event("sql_revision_skipped", reason="empty_sql_candidates")
             data_item.sql_candidates_after_revision = None
@@ -204,6 +205,38 @@ class SQLRevisionRunner:
             }
             return
         
+        sql_candidates = list(sql_candidates or [])
+        filtered_candidates = [("", "empty_candidate_pool")] if not sql_candidates else []
+        if self._enable_typed_repair and self._typed_repairer is not None:
+            screened_candidates = []
+            screened_sources = []
+            for index, (sql, source) in enumerate(zip(sql_candidates, input_sources)):
+                cleaned_sql, passed, diagnostic = self._typed_repairer.pre_screen_candidate(sql, data_item)
+                trace_event(
+                    "repair_pre_screen",
+                    item_id=data_item.get_item_id(),
+                    candidate_index=index,
+                    sql=cleaned_sql,
+                    passed=passed,
+                    diagnostic=diagnostic,
+                    action="continue" if passed else "remove_from_pool",
+                )
+                if passed:
+                    screened_candidates.append(cleaned_sql)
+                    screened_sources.append(source)
+                else:
+                    filtered_candidates.append((cleaned_sql, diagnostic))
+            sql_candidates = screened_candidates
+            input_sources = screened_sources
+            trace_event(
+                "sql_revision_screening_summary",
+                item_id=data_item.get_item_id(),
+                input_count=len(data_item.sql_candidates or []),
+                accepted_count=len(sql_candidates),
+                filtered_count=len(filtered_candidates),
+                filtered=filtered_candidates,
+            )
+
         # Deduplicate candidates using normalized SQL as key
         # normalized_sql -> original_sql
         unique_candidates_map = {}
@@ -275,11 +308,15 @@ class SQLRevisionRunner:
             # Map results back to the original candidates list (preserving order and duplicates)
             final_revised_candidates = []
             final_candidate_sources = []
+            unresolved_repair_candidates = []
             for idx, sql in enumerate(sql_candidates):
                 norm = self._normalize_sql(sql)
                 revised_sql, _ = norm_to_result[norm]
-                final_revised_candidates.append(revised_sql)
-                final_candidate_sources.append(input_sources[idx])
+                if revised_sql:
+                    final_revised_candidates.append(revised_sql)
+                    final_candidate_sources.append(input_sources[idx])
+                else:
+                    unresolved_repair_candidates.append((sql, "type_specific_repair_unresolved"))
 
             # Pool recovery (SIRIUS): when no revised candidate is clean, generate
             # one recovery candidate from condensed failure feedback.
@@ -289,6 +326,7 @@ class SQLRevisionRunner:
                     final_revised_candidates,
                     self._llm,
                     self._stage_config.checker_sampling_budget,
+                    filtered_candidates=filtered_candidates + unresolved_repair_candidates,
                 )
                 if recovery_sql:
                     final_revised_candidates.append(recovery_sql)

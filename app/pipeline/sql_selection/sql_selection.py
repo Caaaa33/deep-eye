@@ -95,6 +95,9 @@ class SQLSelectionRunner:
         checkpoint_interval: int,
     ):
         self._stage_config = stage_config
+        self._ablation_arm = stage_config.ablation_arm
+        if self._ablation_arm in ("B", "D") and stage_config.judge_llm is None:
+            raise ValueError(f"Arm {self._ablation_arm} requires [sql_selection].judge_llm_profile or [sql_selection.judge_llm]")
         self._dataset_config = dataset_config
         self._input_save_path = input_save_path
         self._extractor_max_retry = extractor_max_retry
@@ -120,19 +123,22 @@ class SQLSelectionRunner:
             bigquery_credential_path=self._dataset_config.bigquery_credential_path,
             snowflake_credential_path=self._dataset_config.snowflake_credential_path,
         )
-        self._llm = LLM(self._stage_config.llm)
+        self._llm = None if self._ablation_arm == "E" else LLM(self._stage_config.llm)
         # SIRIUS uses a pairwise reward model as judge; when a dedicated judge
         # model is configured we use it for A/B comparison so the selecting
         # model is no longer the same one that generated the candidates.
         judge_llm_config = getattr(self._stage_config, "judge_llm", None)
-        self._judge_llm = LLM(judge_llm_config) if judge_llm_config is not None else self._llm
-        if judge_llm_config is not None:
+        use_dedicated_judge = judge_llm_config is not None and self._ablation_arm in (None, "B", "D")
+        self._judge_llm = LLM(judge_llm_config) if use_dedicated_judge else self._llm
+        if use_dedicated_judge:
             logger.info(
                 f"Using dedicated judge LLM for pairwise comparison: model={judge_llm_config.model}, "
                 f"temperature={judge_llm_config.temperature}"
             )
-        else:
+        elif self._judge_llm is not None:
             logger.info(f"Pairwise judge falls back to the selection LLM: model={self._judge_llm.llm_config.model}")
+        else:
+            logger.info("Arm E uses result-majority voting without a judge LLM")
         logger.info(f"SQL selection parallelism: {self._parallelism}")
         self._thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
         self._inner_thread_pool_executor = ThreadPoolExecutor(max_workers=self._parallelism)
@@ -141,7 +147,7 @@ class SQLSelectionRunner:
         configure_tracing(Path(self._stage_config.save_path).parent / "trace", stage="sql_selection")
 
     @classmethod
-    def from_config(cls, app_config=None) -> "SQLSelectionRunner":
+    def from_config(cls, app_config=None, input_save_path: Optional[str] = None) -> "SQLSelectionRunner":
         if app_config is None:
             from app.config import get_config
 
@@ -149,7 +155,7 @@ class SQLSelectionRunner:
         return cls(
             stage_config=app_config.sql_selection_config,
             dataset_config=app_config.dataset_config,
-            input_save_path=app_config.sql_revision_config.save_path,
+            input_save_path=input_save_path or app_config.sql_revision_config.save_path,
             extractor_max_retry=app_config.llm_extractor_config.max_retry,
             parallelism=app_config.run_config.parallelism,
             progress_log_interval=app_config.run_config.progress_log_interval,
@@ -200,6 +206,14 @@ class SQLSelectionRunner:
             logger.error(f"Error parsing LLM response: {e}")
             logger.debug(f"Response content: {response}")
             return None
+
+    @staticmethod
+    def _parse_legacy_llm_response(response: str) -> Optional[str]:
+        match = re.search(r"<result>(.*?)</result>", response, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return None
+        vote = match.group(1).strip().upper()
+        return vote if vote in ("A", "B") else None
 
     def _get_top_k_sql_candidates(self, data_item: DataItem) -> Tuple[List[Tuple[str, str, float, float]], Dict[str, Any]]:
         item_id = data_item.get_item_id()
@@ -321,7 +335,9 @@ class SQLSelectionRunner:
         candidates = [
             (
                 sql_candidate,
-                _build_judge_result_view(sql_map_to_execution_result[sql_candidate]),
+                (sql_map_to_execution_result[sql_candidate].result_table_str
+                 if self._ablation_arm == "F"
+                 else _build_judge_result_view(sql_map_to_execution_result[sql_candidate])),
                 consistency_score,
                 execution_time,
             )
@@ -437,6 +453,7 @@ class SQLSelectionRunner:
             sql_b,
             execution_result_table_str_b,
             db_type=db_type,
+            prompt_version="old" if self._ablation_arm in ("A", "B", "F") else "new",
         )
         trace_event(
             "selection_compare_prompt",
@@ -444,6 +461,8 @@ class SQLSelectionRunner:
             b_idx=b_idx,
             swapped=swapped,
             judge_model=self._judge_llm.llm_config.model,
+            ablation_arm=self._ablation_arm,
+            prompt_version="old" if self._ablation_arm in ("A", "B", "F") else "new",
             judge_is_stage_llm=self._judge_llm is self._llm,
             presented_sql_a=sql_a,
             presented_sql_b=sql_b,
@@ -455,7 +474,7 @@ class SQLSelectionRunner:
         votes, total_token_usage = self._extractor.extract_with_retry(
             llm=self._judge_llm,
             messages=[{"role": "user", "content": prompt}],
-            rule_parser=self._parse_llm_response,
+            rule_parser=self._parse_legacy_llm_response if self._ablation_arm in ("A", "B", "F") else self._parse_llm_response,
             fix_end_token=self._judge_llm.llm_config.fix_end_token,
             end_token="</result>",
             n=self._stage_config.evaluator_sampling_budget,
@@ -577,6 +596,7 @@ class SQLSelectionRunner:
         total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 
         top_k_sql_candidates, selection_meta = self._get_top_k_sql_candidates(data_item)
+        trace_event("selection_arm", item_id=item_id, arm=self._ablation_arm or "default")
         
         if len(top_k_sql_candidates) == 0:
             trace_event(
@@ -636,6 +656,22 @@ class SQLSelectionRunner:
             )
             return
         
+        if self._ablation_arm == "E":
+            data_item.final_selected_sql = top_k_sql_candidates[0][0]
+            data_item.sql_selection_time = time.time() - start_time
+            data_item.sql_selection_llm_cost = total_token_usage
+            data_item.total_time += data_item.sql_selection_time
+            trace_event("selection_end", item_id=item_id, status="completed", branch="majority_only", final_selected_sql=data_item.final_selected_sql, token_usage=total_token_usage, duration_ms=data_item.sql_selection_time * 1000)
+            return
+
+        if self._ablation_arm == "F" and top_k_sql_candidates[0][2] >= self._stage_config.shortcut_consistency_score_threshold:
+            data_item.final_selected_sql = top_k_sql_candidates[0][0]
+            data_item.sql_selection_time = time.time() - start_time
+            data_item.sql_selection_llm_cost = total_token_usage
+            data_item.total_time += data_item.sql_selection_time
+            trace_event("selection_end", item_id=item_id, status="completed", branch="original_consistency_shortcut", final_selected_sql=data_item.final_selected_sql, token_usage=total_token_usage, duration_ms=data_item.sql_selection_time * 1000)
+            return
+
         # SIRIUS §3.5: pairwise reward-model comparison is mandatory whenever
         # >1 distinct-result candidate survives; the confidence gate only
         # decides whether Stage 2 (cross-source structural support) runs.
@@ -649,12 +685,12 @@ class SQLSelectionRunner:
         # 每对候选跑两种展示顺序（SIRIUS Eq.25），故票维是 2 * sampling budget；
         # 未产出投票的槽位保持 NaN，聚合时被忽略。
         sampling_budget = self._stage_config.evaluator_sampling_budget
-        win_matrix = np.full(
-            (len(top_k_sql_candidates), len(top_k_sql_candidates), sampling_budget * 2),
-            np.nan,
-        )
+        shape = (len(top_k_sql_candidates), len(top_k_sql_candidates), sampling_budget * (1 if self._ablation_arm == "F" else 2))
+        win_matrix = np.zeros(shape) if self._ablation_arm == "F" else np.full(shape, np.nan)
         sql_to_idx = {sql[0]: idx for idx, sql in enumerate(top_k_sql_candidates)}
         pair_sqls_to_eval = self._get_pair_sqls_to_eval(top_k_sql_candidates)
+        if self._ablation_arm == "F":
+            pair_sqls_to_eval = [pair for pair in pair_sqls_to_eval if not pair[2]]
 
         trace_event(
             "selection_decision",
@@ -747,6 +783,23 @@ class SQLSelectionRunner:
                 duration_ms=(time.time() - start_time) * 1000,
             )
         else:
+            if self._ablation_arm == "F":
+                robust_win_matrix = self._compute_robust_win_matrix(win_matrix)
+                mean_win_scores = np.mean(robust_win_matrix, axis=1)
+                consistency_scores = np.array([sql[2] for sql in top_k_sql_candidates])
+                ranking_scores = mean_win_scores * (consistency_scores / np.sum(consistency_scores))
+                best_idx = int(np.argsort(-ranking_scores)[0])
+                data_item.final_selected_sql = top_k_sql_candidates[best_idx][0]
+                trace_event("selection_ranking", item_id=item_id, branch="original", mean_win_scores=mean_win_scores.tolist(), consistency_scores=consistency_scores.tolist(), ranking_scores=ranking_scores.tolist(), selected_idx=best_idx)
+                data_item.sql_selection_time = time.time() - start_time
+                data_item.sql_selection_llm_cost = total_token_usage
+                data_item.total_time += data_item.sql_selection_time
+                data_item.total_llm_cost = {
+                    key: data_item.total_llm_cost[key] + total_token_usage[key]
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                }
+                trace_event("selection_end", item_id=item_id, status="completed", branch="original_pairwise", final_selected_sql=data_item.final_selected_sql, token_usage=total_token_usage, duration_ms=data_item.sql_selection_time * 1000)
+                return
             # Candidate provenance (dc / skeleton / icl / recovery) aligned with
             # the revised pool; needed for cross-source structural support.
             revised_sqls = list(data_item.sql_candidates_after_revision or [])

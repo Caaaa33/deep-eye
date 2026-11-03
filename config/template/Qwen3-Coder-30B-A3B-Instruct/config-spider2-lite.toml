@@ -47,6 +47,7 @@ icl_sampling_budget = 12
 
 ########## SQL revision configuration ##########
 [sql_revision]
+enable_typed_repair = true
 checker_sampling_budget = 16
 checkers = ["SyntaxChecker", "ResultChecker"]
 
